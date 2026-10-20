@@ -1,0 +1,4 @@
+FROM node:26.12.0-bookworm-slim
+RUN npm install --global @yarnpkg/cli-dist@4.18.1
+WORKDIR /app
+CMD ["sleep", "infinity"]

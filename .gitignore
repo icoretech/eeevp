@@ -1,0 +1,15 @@
+node_modules/
+.next/
+.yarn/
+.env*
+!.env.example
+.DS_Store
+.omo/
+.sisyphus/
+.synteq/
+coverage/
+test-results/
+playwright-report/
+public/eeevp-sw.js
+*.tsbuildinfo
+data/

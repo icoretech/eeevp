@@ -1,0 +1,27 @@
+# One small persistent server; keep the volume across releases and restarts.
+name: eeevp
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env.production
+    environment:
+      STORAGE_PATH: /app/data
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - video_data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  video_data:
