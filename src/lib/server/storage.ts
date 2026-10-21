@@ -257,7 +257,8 @@ export class VideoStorage {
       }
       return body;
     } catch (error) {
-      cache.delete(id);
+      // A superseded media request says nothing about an immutable manifest's validity.
+      if (!signal?.aborted) cache.delete(id);
       throw error;
     }
   }

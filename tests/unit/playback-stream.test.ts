@@ -487,6 +487,7 @@ describe("encrypted video progressive playback", () => {
     expect(notify).toHaveBeenCalledTimes(1);
     expect(fetcher).toHaveBeenCalledTimes(3);
     await reader.cancel();
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
     expect(signals.get(1)?.aborted).toBe(true);
     expect(signals.get(2)?.aborted).toBe(true);
     const cached = service.respond(
@@ -498,6 +499,33 @@ describe("encrypted video progressive playback", () => {
     );
     expect(fetcher).toHaveBeenCalledTimes(3);
     expect(notify).toHaveBeenCalledTimes(2);
+  });
+
+  it("hands an in-flight packet to the next native range without refetching ciphertext", async () => {
+    const video = await encryptedVideo(19);
+    const gate = Promise.withResolvers<Response>();
+    const { service, fetcher, notify, url } = await setup(
+      video,
+      () => gate.promise,
+    );
+    const first = bodyReader(
+      service.respond(
+        ownerId,
+        new Request(url, { headers: { Range: "bytes=0-9" } }),
+      ),
+    );
+    const reading = first.read();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await first.cancel();
+    const next = service
+      .respond(ownerId, new Request(url, { headers: { Range: "bytes=5-18" } }))
+      .arrayBuffer();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    gate.resolve(new Response(video.packets[0]));
+    expect(await reading).toEqual({ done: true, value: undefined });
+    expect(new Uint8Array(await next)).toEqual(video.bytes.slice(5));
+    expect(notify).toHaveBeenCalledTimes(1);
   });
 
   it("keeps overlapping readers alive when one cancels, then flushes ciphertext on lock", async () => {
@@ -753,6 +781,7 @@ describe("encrypted video progressive playback", () => {
     const reading = reader.read();
     const signal = await started.promise;
     await reader.cancel();
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
     expect(signal.aborted).toBe(true);
     expect(await reading).toEqual({ done: true, value: undefined });
   });
@@ -787,6 +816,7 @@ describe("encrypted video progressive playback", () => {
     );
 
     await expect(reading).resolves.toEqual({ done: true, value: undefined });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
     expect(chunkRequest.aborted).toBe(true);
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(notify).not.toHaveBeenCalled();

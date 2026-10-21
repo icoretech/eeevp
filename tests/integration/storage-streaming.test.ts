@@ -146,6 +146,33 @@ describe("bounded immutable streaming metadata", () => {
     });
   });
 
+  it("keeps validated metadata warm when a seek cancels its packet download", async () => {
+    const f = await fixture();
+    await f.storage.readChunk(f.id, 0);
+    const abort = new AbortController();
+    const original = FilesystemObjectStore.prototype.read;
+    const reads = vi
+      .spyOn(FilesystemObjectStore.prototype, "read")
+      .mockImplementationOnce(async function (
+        this: FilesystemObjectStore,
+        key,
+        limit,
+        signal,
+      ) {
+        const bytes = await original.call(this, key, limit, signal);
+        abort.abort(new Error("new seek"));
+        return bytes;
+      });
+    await expect(f.storage.readChunk(f.id, 0, abort.signal)).rejects.toThrow(
+      "new seek",
+    );
+    reads.mockClear();
+    expect(await f.storage.readChunk(f.id, 0)).toEqual(f.packet);
+    expect(reads.mock.calls.map(([key]) => key)).toEqual([
+      `videos/${f.id}/chunks/0`,
+    ]);
+  });
+
   it("keeps cached manifests isolated from a different storage namespace", async () => {
     const f = await fixture();
     await f.storage.readChunk(f.id, 0);

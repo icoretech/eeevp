@@ -4,6 +4,8 @@ const TOTAL_BUDGET = 32 * 1024 * 1024;
 // A finite lease bounds reuse after server session expiry; explicit lock/401 clears immediately.
 const CACHE_TTL = 30_000;
 const DOWNLOADS = 3;
+// Native players hand adjacent byte ranges off between responses before reattaching their readers.
+const HANDOFF_GRACE = 50;
 
 type CachedPacket = {
   session: string;
@@ -67,6 +69,7 @@ type Download = {
   abort: AbortController;
   readers: number;
   running: boolean;
+  orphanTimer?: ReturnType<typeof setTimeout>;
   result: ReturnType<typeof Promise.withResolvers<ArrayBuffer>>;
 };
 
@@ -98,6 +101,8 @@ export class PlaybackPackets {
       this.downloads.set(index, download);
     }
     const leased = download;
+    clearTimeout(leased.orphanTimer);
+    leased.orphanTimer = undefined;
     leased.readers += 1;
     this.pump();
     let released = false;
@@ -108,20 +113,43 @@ export class PlaybackPackets {
         released = true;
         leased.readers -= 1;
         if (leased.readers === 0 && this.downloads.get(index) === leased) {
-          this.downloads.delete(index);
-          leased.abort.abort(new Error("Playback packet no longer needed."));
-          leased.result.reject(leased.abort.signal.reason);
+          if (leased.running) {
+            leased.orphanTimer = setTimeout(() => {
+              this.discard(leased);
+              this.pump();
+            }, HANDOFF_GRACE);
+          } else this.discard(leased);
         }
         this.pump();
       },
     };
   }
 
+  private discard(download: Download) {
+    clearTimeout(download.orphanTimer);
+    download.orphanTimer = undefined;
+    if (this.downloads.get(download.index) === download)
+      this.downloads.delete(download.index);
+    download.abort.abort(new Error("Playback packet no longer needed."));
+    download.result.reject(download.abort.signal.reason);
+  }
+
   private pump() {
     if (this.closed) return;
+    // A genuinely different seek takes precedence over the short native handoff grace.
+    if (
+      this.active >= DOWNLOADS &&
+      [...this.downloads.values()].some(
+        (item) => !item.running && item.readers > 0,
+      )
+    ) {
+      for (const item of this.downloads.values()) {
+        if (item.running && item.readers === 0) this.discard(item);
+      }
+    }
     for (const download of this.downloads.values()) {
       if (this.active >= DOWNLOADS) break;
-      if (download.running) continue;
+      if (download.running || download.readers === 0) continue;
       download.running = true;
       this.active += 1;
       void this.load(download.index, download.abort.signal)
@@ -133,6 +161,8 @@ export class PlaybackPackets {
         })
         .catch((error: unknown) => download.result.reject(error))
         .finally(() => {
+          clearTimeout(download.orphanTimer);
+          download.orphanTimer = undefined;
           this.active -= 1;
           if (this.downloads.get(download.index) === download)
             this.downloads.delete(download.index);
@@ -148,6 +178,8 @@ export class PlaybackPackets {
     this.closed = true;
     this.cache.clear(this.session);
     for (const download of this.downloads.values()) {
+      clearTimeout(download.orphanTimer);
+      download.orphanTimer = undefined;
       download.abort.abort(new Error("Playback is locked."));
       download.result.reject(download.abort.signal.reason);
     }

@@ -37,8 +37,62 @@ describe("ciphertext packet scheduler", () => {
     second.release();
     third.release();
     queued.release();
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
     expect(signals.get(1)?.aborted).toBe(true);
     expect(signals.get(2)?.aborted).toBe(true);
+    await tick();
+  });
+
+  it("reuses in-flight packets across native range handoff and expires orphan grace exactly", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const signal = new AbortController();
+    const gate = Promise.withResolvers<ArrayBuffer>();
+    let transportSignal = signal.signal;
+    const load = vi.fn((_index: number, current: AbortSignal) => {
+      transportSignal = current;
+      current.addEventListener("abort", () => gate.reject(current.reason));
+      return gate.promise;
+    });
+    const packets = new PlaybackPackets("a", new CiphertextCache(), load);
+    const first = packets.acquire(7);
+    first.release();
+    await vi.advanceTimersByTimeAsync(49);
+    expect(transportSignal.aborted).toBe(false);
+    const handoff = packets.acquire(7);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(transportSignal.aborted).toBe(false);
+    handoff.release();
+    await vi.advanceTimersByTimeAsync(49);
+    expect(transportSignal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(transportSignal.aborted).toBe(true);
+    await expect(handoff.promise).rejects.toThrow("no longer needed");
+  });
+
+  it("bypasses grace immediately for lock and for a new seek requiring occupied slots", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const signals = new Map<number, AbortSignal>();
+    const load = vi.fn((index: number, signal: AbortSignal) => {
+      signals.set(index, signal);
+      return new Promise<ArrayBuffer>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason));
+      });
+    });
+    const packets = new PlaybackPackets("a", new CiphertextCache(), load);
+    const old = [0, 1, 2].map((index) => packets.acquire(index));
+    for (const item of old) item.release();
+    expect([...signals.values()].every((signal) => !signal.aborted)).toBe(true);
+    const fresh = packets.acquire(19);
+    expect([0, 1, 2].every((index) => signals.get(index)?.aborted)).toBe(true);
+    await tick();
+    expect(load.mock.calls.map(([index]) => index)).toEqual([0, 1, 2, 19]);
+    expect(signals.get(19)?.aborted).toBe(false);
+    fresh.release();
+    expect(vi.getTimerCount()).toBe(1);
+    packets.close();
+    expect(signals.get(19)?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
     await tick();
   });
 
