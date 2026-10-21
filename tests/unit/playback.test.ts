@@ -54,12 +54,135 @@ function workerMessage(
   target.dispatchEvent(event);
 }
 
+function resumeMessage(
+  target: EventTarget,
+  source: object,
+  sessionId: string,
+  port: MessagePort,
+) {
+  const event = new Event("message");
+  Object.defineProperties(event, {
+    source: { value: source },
+    origin: { value: origin },
+    ports: { value: [port] },
+    data: { value: { type: "playback-resume", sessionId } },
+  });
+  target.dispatchEvent(event);
+}
+
+function activityMessage(
+  target: EventTarget,
+  source: object,
+  sessionId: string,
+  message: Record<string, unknown>,
+  messageOrigin = origin,
+) {
+  const event = new Event("message");
+  Object.defineProperties(event, {
+    source: { value: source },
+    origin: { value: messageOrigin },
+    data: { value: { type: "decryption-activity", sessionId, ...message } },
+  });
+  target.dispatchEvent(event);
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers();
 });
 
 describe("browser playback session lifecycle", () => {
+  it("accepts only bounded owner activity and clears the source on close", async () => {
+    const { worker, serviceWorker } = browser();
+    const { manifest, credentials, metadata } = await video();
+    const playback = await openPlayback(manifest, credentials, metadata);
+    const sessionId = new URL(playback.url).pathname.split("/").at(-1);
+    if (!sessionId) throw new Error("Expected a playback session id.");
+    activityMessage(serviceWorker, {}, sessionId, {
+      index: 0,
+      plaintextBytes: manifest.size,
+      phase: "verified",
+    });
+    activityMessage(serviceWorker, worker, crypto.randomUUID(), {
+      index: 0,
+      plaintextBytes: manifest.size,
+      phase: "verified",
+    });
+    activityMessage(serviceWorker, worker, sessionId, {
+      index: 2,
+      plaintextBytes: manifest.size,
+      phase: "verified",
+    });
+    activityMessage(serviceWorker, worker, sessionId, {
+      index: 0,
+      plaintextBytes: manifest.size + 1,
+      phase: "verified",
+    });
+    activityMessage(
+      serviceWorker,
+      worker,
+      sessionId,
+      {
+        index: 0,
+        plaintextBytes: manifest.size,
+        phase: "verified",
+      },
+      "https://untrusted.example.com",
+    );
+    expect(playback.activity.getSnapshot().verifiedChunks).toBe(0);
+    activityMessage(serviceWorker, worker, sessionId, {
+      index: 0,
+      plaintextBytes: manifest.size,
+      phase: "verified",
+    });
+    expect(playback.activity.getSnapshot()).toMatchObject({
+      verifiedChunks: 1,
+      verifiedBytes: manifest.size,
+      lastVerifiedChunk: 0,
+    });
+    playback.close();
+    expect(playback.activity.getSnapshot().verifiedChunks).toBe(0);
+    activityMessage(serviceWorker, worker, sessionId, {
+      index: 0,
+      plaintextBytes: manifest.size,
+      phase: "verified",
+    });
+    expect(playback.activity.getSnapshot().verifiedChunks).toBe(0);
+  });
+
+  it("restores only its live session to the same controller through a private port", async () => {
+    const { worker, serviceWorker } = browser();
+    const { manifest, credentials, metadata } = await video();
+    const playback = await openPlayback(manifest, credentials, metadata);
+    const sessionId = new URL(playback.url).pathname.split("/").at(-1);
+    if (!sessionId) throw new Error("Expected a playback session id.");
+    const channel = new MessageChannel();
+    const received = Promise.withResolvers<unknown>();
+    channel.port1.onmessage = (event) => received.resolve(event.data);
+    resumeMessage(serviceWorker, {}, sessionId, channel.port2);
+    resumeMessage(serviceWorker, worker, crypto.randomUUID(), channel.port2);
+    resumeMessage(serviceWorker, worker, sessionId, channel.port2);
+    expect(await received.promise).toEqual({
+      type: "unlock",
+      sessionId,
+      manifest,
+      credentials,
+      metadata,
+    });
+    expect(playback.disconnected.aborted).toBe(false);
+    channel.port1.close();
+    channel.port2.close();
+    playback.close();
+    const closed = new MessageChannel();
+    const leaked = vi.fn();
+    closed.port1.onmessage = leaked;
+    resumeMessage(serviceWorker, worker, sessionId, closed.port2);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(leaked).not.toHaveBeenCalled();
+    closed.port1.close();
+    closed.port2.close();
+  });
+
   it("waits for private unlock acknowledgement and releases its key on normal close", async () => {
     const { worker, serviceWorker } = browser();
     const { manifest, credentials, metadata } = await video();

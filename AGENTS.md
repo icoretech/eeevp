@@ -1,16 +1,26 @@
 # EEEVP
 
 - EEEVP means encrypted end-to-end video player
-- The product is a private authenticated video library with its canonical catalog on the server; every video list, metadata, and chunk request requires the library session
-- Keep the separate master encryption key in browser memory only; authenticated devices unlock the same server catalog with that key
+- The product is a browser-encrypted video library with its canonical encrypted catalog on the server; every video list, metadata, and chunk request requires the convenience session
+- Any nonempty key opens the browser workspace; only the matching encryption key decrypts names and videos, and the key remains in browser memory
+- POST /api/session accepts an empty JSON object without receiving or checking the entered key; session presence and Origin guards do not prove key possession, and writable private-use mode still lacks strong write authorization
+- DEMO_MODE is mandatory: true makes the public synthetic demo read-only and requires an intentionally public DEMO_PUBLIC_KEY for the editable prefilled field; false is local/private use with a different encryption key and storage namespace
+- In DEMO_MODE=true, every library initialization, upload, chunk write, completion, and deletion route must return 403 before mutation; session operations and encrypted reads remain available
 - Use Docker Compose for all JavaScript tooling: `docker compose exec -T web yarn ...`; do not silently run checks on the host
 - Use Yarn 4 and install dependencies through Yarn commands
 - Read the installed Next.js documentation under `node_modules/next/dist/docs` before changing framework behavior
 - Do not use `any`, non-null assertions, or unvalidated mandatory environment defaults
 - Keep application tests under `tests/`, separate from source files
 - Use official shadcn CLI components; do not hand-edit `src/components/ui` or `src/lib/utils.ts`
-- Keys and plaintext video metadata belong exclusively in the browser; never send decryption keys to the server, query strings, logs, or analytics
-- Ciphertext and manifests persist under STORAGE_PATH on one durable filesystem shared by all server processes; never use process memory for durable state, and never deploy on an ephemeral filesystem
+- Private encryption keys and plaintext video metadata belong exclusively in the browser; never send private keys to server configuration, requests, logs, or analytics, and never publish an existing private recovery key
+- DEMO_PUBLIC_KEY is the explicit intentionally public exception used only with synthetic read-only samples; never reuse it or its storage namespace for private content
+- Private-mode recovery import and key generation belong under initially collapsed Advanced key tools; public demo mode exposes only the editable prefilled key and login, without advanced/import/generate controls
+- Keep robots.txt disallowing all paths and page metadata set to noindex and nofollow; crawler directives are not access controls
+- Drive the fixed-height decryption HUD only from successful authenticated chunk events for the exact playback owner; deduplicate coverage, keep notifications at most 5 Hz, expose no keys/plaintext/names/URLs, and keep idle and reduced-motion states static
+- Synteq Apps is the primary hosting target; use STORAGE_DRIVER=s3 with exactly one configured private R2 bucket and S3_PREFIX for the encrypted descriptor, catalog, drafts, chunks, and deletion markers
+- Local development uses STORAGE_DRIVER=filesystem with mandatory absolute STORAGE_PATH on one persistent volume shared by all server processes; independent replica disks are unsupported
+- Keep canonical state in the explicitly selected durable backend across replicas; never fall back to another backend or store durable state in process memory or temporary app-local disk, and retain deletion markers permanently
+- Stream the original browser-playable MP4 or WebM; the app has no server-side transcoding, FFmpeg processing, or media job queue, and no Serverless Functions are implemented
 - Run `yarn biome:check`, `yarn typecheck`, and the relevant tests inside the web container after TypeScript changes
 - Run production builds with `NODE_ENV=production`
 - Keep technical documentation in `docs/` current and use generic sample values

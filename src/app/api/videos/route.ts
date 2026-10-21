@@ -2,7 +2,13 @@
 import type { NextRequest } from "next/server";
 import { requireLibrarySession } from "@/lib/server/auth";
 import { getConfig } from "@/lib/server/config";
-import { handleApi, json, readJson, requireOrigin } from "@/lib/server/http";
+import {
+  handleApi,
+  json,
+  readJson,
+  requireOrigin,
+  requireWritableLibrary,
+} from "@/lib/server/http";
 import { withStorage } from "@/lib/server/storage";
 import { libraryVideoSchema } from "@/lib/video/schema";
 
@@ -13,7 +19,7 @@ const draftSchema = libraryVideoSchema.omit({ createdAt: true });
 export async function GET(request: NextRequest) {
   return handleApi(async () => {
     const config = getConfig();
-    requireLibrarySession(request, config);
+    await requireLibrarySession(request, config);
     return withStorage(config, async (storage) =>
       json({ videos: await storage.list() }),
     );
@@ -23,7 +29,8 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   return handleApi(async () => {
     const config = getConfig();
-    requireLibrarySession(request, config);
+    requireWritableLibrary(config);
+    await requireLibrarySession(request, config);
     requireOrigin(request, config);
     const body = draftSchema.parse(await readJson(request));
     return withStorage(config, async (storage) => {

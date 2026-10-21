@@ -1,4 +1,4 @@
-// Real route invocations cover private library authentication, strict bodies and durable encrypted video records.
+// Real route invocations cover opaque library sessions, strict bodies and durable encrypted video records.
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,13 +37,13 @@ import {
 import { handleApi, readJson } from "@/lib/server/http";
 
 const origin = "https://example.com";
-const password = "sample-library-password";
 let directory: string;
 
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "eeevp-route-"));
   vi.stubEnv("APP_ORIGIN", origin);
-  vi.stubEnv("LIBRARY_PASSWORD", password);
+  vi.stubEnv("STORAGE_DRIVER", "filesystem");
+  vi.stubEnv("DEMO_MODE", "false");
   vi.stubEnv(
     "SESSION_SECRET",
     "sample-session-secret-for-tests-only-123456789",
@@ -68,7 +68,7 @@ async function signIn() {
     request("/api/session", {
       method: "POST",
       headers: { origin, "content-type": "application/json" },
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({}),
     }),
   );
   expect(response.status).toBe(200);
@@ -77,8 +77,8 @@ async function signIn() {
   return cookie;
 }
 
-describe("HTTP authentication guards", () => {
-  it("signs and clears HttpOnly secure cookies and rejects invalid credentials and origins", async () => {
+describe("HTTP session guards", () => {
+  it("signs and clears HttpOnly secure cookies and rejects foreign origins without receiving encryption keys", async () => {
     expect(await (await session(request("/api/session"))).json()).toEqual({
       authenticated: false,
     });
@@ -94,18 +94,10 @@ describe("HTTP authentication guards", () => {
           origin: "https://other.example.com",
           "content-type": "application/json",
         },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({}),
       }),
     );
     expect(blocked.status).toBe(403);
-    const incorrect = await login(
-      request("/api/session", {
-        method: "POST",
-        headers: { origin, "content-type": "application/json" },
-        body: JSON.stringify({ password: "incorrect" }),
-      }),
-    );
-    expect(incorrect.status).toBe(401);
     const cleared = await logout(
       request("/api/session", {
         method: "DELETE",
@@ -118,14 +110,49 @@ describe("HTTP authentication guards", () => {
     expect(cleared.headers.get("set-cookie")).toContain("SameSite=strict");
   });
 
+  it.each([
+    ["missing", undefined],
+    ["opaque null", "null"],
+  ] as const)(
+    "rejects %s Origin on session creation and logout even with a matching Referer",
+    async (_label, suppliedOrigin) => {
+      const headers = new Headers({
+        "content-type": "application/json",
+        referer: `${origin}/`,
+      });
+      if (suppliedOrigin !== undefined) headers.set("origin", suppliedOrigin);
+      const rejectedLogin = await login(
+        request("/api/session", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({}),
+        }),
+      );
+      expect(rejectedLogin.status).toBe(403);
+      expect(rejectedLogin.headers.get("set-cookie")).toBeNull();
+      expect(await rejectedLogin.json()).toEqual({
+        error: "Request origin is not allowed",
+      });
+
+      const cookie = await signIn();
+      headers.set("cookie", cookie);
+      const rejectedLogout = await logout(
+        request("/api/session", { method: "DELETE", headers }),
+      );
+      expect(rejectedLogout.status).toBe(403);
+      expect(rejectedLogout.headers.get("set-cookie")).toBeNull();
+      expect(
+        await (
+          await session(request("/api/session", { headers: { cookie } }))
+        ).json(),
+      ).toEqual({ authenticated: true });
+    },
+  );
+
   it("rejects unknown fields, wrong media types, malformed JSON and oversized bodies", async () => {
     for (const [body, contentType, expected] of [
-      [
-        JSON.stringify({ password, key: "browser-only" }),
-        "application/json",
-        400,
-      ],
-      [JSON.stringify({ password }), "text/plain", 415],
+      [JSON.stringify({ key: "browser-only" }), "application/json", 400],
+      [JSON.stringify({}), "text/plain", 415],
       ["{", "application/json", 400],
       [" ".repeat(4097), "application/json", 413],
     ] as const) {

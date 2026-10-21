@@ -1,14 +1,14 @@
 "use client";
 
-// Authenticated playback unwraps one video key with the in-memory library key and streams decrypted chunks locally.
+// Browser playback unwraps one video key with the in-memory library key and streams decrypted chunks locally.
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { z } from "zod";
+import { DecryptionActivity } from "@/components/decryption-activity";
 import { useLibrary } from "@/components/library-provider";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { LockGlyph, VideoGlyph } from "@/components/video-shell";
+import { LockGlyph, VideoGlyph } from "@/components/video-glyphs";
 import {
   LibrarySessionExpired,
   libraryRequest,
@@ -21,7 +21,30 @@ const videoResponseSchema = z.strictObject({ video: libraryVideoSchema });
 type WatchState =
   | { status: "opening" }
   | { status: "error"; message: string }
-  | { status: "ready"; url: string; metadata: VideoMetadata };
+  | {
+      status: "ready";
+      url: string;
+      metadata: VideoMetadata;
+      activity: Awaited<ReturnType<typeof openPlayback>>["activity"];
+    };
+
+const privatePlaybackCopy = {
+  badge: "Private playback",
+  region: "Private video player",
+  placeholderTitle: "Your private video.",
+  description:
+    "Your encryption key stays in this browser. The server delivers encrypted chunks.",
+  libraryLabel: "Private library",
+  pendingCaption: "YOUR LIBRARY KEY STAYS IN THE BROWSER",
+};
+const demoPlaybackCopy = {
+  badge: "Demo playback",
+  region: "Demo video player",
+  placeholderTitle: "Demo playback.",
+  description: "This demo key is public. Decryption happens in your browser.",
+  libraryLabel: "Demo library",
+  pendingCaption: "BROWSER DECRYPTION",
+};
 
 export function VideoWatch({ id }: { id: string }) {
   const [attempt, setAttempt] = useState(0);
@@ -35,16 +58,19 @@ export function VideoWatch({ id }: { id: string }) {
 }
 
 function VideoPlayback({ id, onRetry }: { id: string; onRetry: () => void }) {
-  const { library, libraryKey, expire, registerCleanup } = useLibrary();
+  const { library, libraryKey, expire, registerCleanup, demoMode } =
+    useLibrary();
   const [state, setState] = useState<WatchState>({ status: "opening" });
   const stopPlayback = useRef<(() => void) | null>(null);
   const mediaRequest = useRef<AbortController | null>(null);
   const generation = useRef(0);
+  const copy = demoMode ? demoPlaybackCopy : privatePlaybackCopy;
 
+  // react-doctor-disable-next-line react-doctor/no-set-state-after-await-in-effect -- Every async update checks the effect's AbortSignal; release/stop abort it. Verified by tests/browser/playback-lifecycle.spec.ts.
   useEffect(() => {
-    if (!library || !libraryKey) return;
+    if (!libraryKey) return;
     generation.current += 1;
-    const activeLibrary = library;
+    const activeLibraryId = library?.id ?? null;
     const activeKey = libraryKey;
     const controller = new AbortController();
     let playback: Awaited<ReturnType<typeof openPlayback>> | null = null;
@@ -81,8 +107,10 @@ function VideoPlayback({ id, onRetry }: { id: string; onRetry: () => void }) {
         const opened = await openLibraryVideo(
           result.data.video,
           activeKey,
-          activeLibrary.id,
-        );
+          activeLibraryId,
+        ).catch(() => {
+          throw new Error("This video could not be opened.");
+        });
         if (controller.signal.aborted) return;
         const media = document.createElement("video");
         if (!media.canPlayType(opened.metadata.type))
@@ -126,6 +154,7 @@ function VideoPlayback({ id, onRetry }: { id: string; onRetry: () => void }) {
           status: "ready",
           url: playback.url,
           metadata: opened.metadata,
+          activity: playback.activity,
         });
       } catch (failure) {
         if (controller.signal.aborted) return;
@@ -182,23 +211,26 @@ function VideoPlayback({ id, onRetry }: { id: string; onRetry: () => void }) {
   return (
     <>
       <div className="player-toolbar">
-        <Button variant="ghost" nativeButton={false} render={<Link href="/" />}>
+        <Button
+          variant="ghost"
+          nativeButton={false}
+          render={<Link href="/" transitionTypes={["nav-back"]} />}
+        >
           <span aria-hidden="true">←</span>Video library
         </Button>
-        <Badge variant="outline">PRIVATE PLAYBACK</Badge>
+        <Badge variant="outline" className="playback-mode-badge">
+          {copy.badge}
+        </Badge>
       </div>
-      <section aria-label="Private video player" className="player-section">
+      <section aria-label={copy.region} className="player-section">
         <div className="player-heading">
           <p className="eyebrow">DECRYPTED HERE. PLAYED HERE.</p>
           <h1>
             {state.status === "ready"
               ? state.metadata.name
-              : "Your private video."}
+              : copy.placeholderTitle}
           </h1>
-          <p>
-            Your library key stays in this browser. The server delivers
-            encrypted chunks.
-          </p>
+          <p>{copy.description}</p>
         </div>
         <div
           className={`video-stage${state.status === "ready" ? " video-stage-ready" : ""}`}
@@ -240,6 +272,9 @@ function VideoPlayback({ id, onRetry }: { id: string; onRetry: () => void }) {
             </div>
           )}
         </div>
+        <DecryptionActivity
+          activity={state.status === "ready" ? state.activity : null}
+        />
         <div className="player-caption">
           <div>
             <LockGlyph />
@@ -249,23 +284,16 @@ function VideoPlayback({ id, onRetry }: { id: string; onRetry: () => void }) {
                 {" "}
                 /{" "}
               </span>
-              <span className="caption-detail">Private library</span>
+              <span className="caption-detail">{copy.libraryLabel}</span>
             </span>
           </div>
           <span>
             {state.status === "ready"
               ? `${state.metadata.type === "video/mp4" ? "MP4" : "WEBM"} · ORIGINAL QUALITY`
-              : "YOUR LIBRARY KEY STAYS IN THE BROWSER"}
+              : copy.pendingCaption}
           </span>
         </div>
       </section>
-      <Alert className="viewer-note">
-        <AlertTitle>Your library stays private</AlertTitle>
-        <AlertDescription>
-          Videos require your authenticated session and browser-held library
-          key. Lock the library when you finish watching.
-        </AlertDescription>
-      </Alert>
     </>
   );
 }

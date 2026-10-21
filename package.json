@@ -11,13 +11,14 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "esbuild": "0.28.2",
-    "fake-indexeddb": "6.2.6",
+    "react-doctor": "0.9.18",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
     "vite": "8.3.4",
     "vitest": "5.0.5"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1153.0",
     "@base-ui/react": "^1.9.0",
     "class-variance-authority": "^0.7.1",
     "cn": "^0.5.0",
@@ -41,7 +42,9 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "react-doctor": "REACT_DOCTOR_NO_TELEMETRY=1 react-doctor --no-score --no-supply-chain --scope full --blocking warning",
+    "react-doctor:ci": "REACT_DOCTOR_NO_TELEMETRY=1 react-doctor --no-score --no-supply-chain --scope full --blocking warning"
   },
   "dependenciesMeta": {
     "esbuild": {

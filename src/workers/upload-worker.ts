@@ -13,7 +13,7 @@ import {
 const requestSchema = z.strictObject({
   type: z.literal("upload"),
   file: z.instanceof(File),
-  libraryKey: credentialsSchema.shape.key,
+  libraryKey: z.string(),
   library: libraryDescriptorSchema,
 });
 let uploading = false;
@@ -121,6 +121,7 @@ async function upload(
     "Starting the upload",
   );
 
+  // Acknowledging each PUT before reading the next slice bounds memory and stops work on the first failure.
   for (let index = 0; index < manifest.chunkCount; index += 1) {
     const start = index * manifest.chunkSize;
     self.postMessage({
@@ -129,6 +130,7 @@ async function upload(
       completed: start,
       total: manifest.size,
     });
+    // react-doctor-disable-next-line react-doctor/async-await-in-loop -- Keep one 1 MiB read/encrypt/PUT in flight and stop on first failure; tests/integration/upload-worker.test.ts.
     const plaintext = await file
       .slice(start, Math.min(start + manifest.chunkSize, manifest.size))
       .arrayBuffer();
@@ -196,9 +198,20 @@ self.addEventListener("message", async (event: MessageEvent<unknown>) => {
     self.close();
     return;
   }
+  const libraryKey = credentialsSchema.shape.key.safeParse(
+    parsed.data.libraryKey,
+  );
+  if (!libraryKey.success) {
+    self.postMessage({
+      type: "error",
+      message: "This encryption key cannot add videos to the library.",
+    });
+    self.close();
+    return;
+  }
   uploading = true;
   try {
-    await upload(parsed.data.file, parsed.data.libraryKey, parsed.data.library);
+    await upload(parsed.data.file, libraryKey.data, parsed.data.library);
   } catch (error) {
     self.postMessage({
       type: "error",

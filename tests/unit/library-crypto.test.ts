@@ -100,7 +100,7 @@ describe("private library recovery key", () => {
     await expect(verifyLibraryKey(second, key)).resolves.toBeUndefined();
   });
 
-  it("rejects a different recovery key before unlocking an empty library", async () => {
+  it("rejects a different key when checking the encrypted library verifier", async () => {
     const descriptor = await createLibraryDescriptor(createLibraryKey());
 
     await expect(

@@ -150,7 +150,7 @@ describe("private library catalog", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("rejects an unknown master key through native authentication without sending it", async () => {
+  it("fails local decryption with an unrelated key without sending it", async () => {
     const { key, descriptor } = await libraryFixture();
     const fixture = await videoFixture(key, descriptor.id);
     const otherKey = createLibraryKey();
@@ -161,6 +161,44 @@ describe("private library catalog", () => {
       openLibraryVideo(fixture.video, otherKey, descriptor.id),
     ).rejects.toThrow("authentication failed");
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("retains encrypted catalog records when the entered text is not an AES key", async () => {
+    const { key, descriptor } = await libraryFixture();
+    const fixture = await videoFixture(key, descriptor.id);
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json({ videos: [fixture.video] }));
+    vi.stubGlobal("fetch", fetcher);
+    const enteredKey = "arbitrary-nonempty-text";
+
+    const rows = await fetchLibraryCatalog(
+      enteredKey,
+      descriptor.id,
+      new AbortController().signal,
+    );
+
+    expect(rows).toEqual([
+      {
+        video: fixture.video,
+        metadata: null,
+        error: "This video's encrypted metadata could not be opened.",
+      },
+    ]);
+    expect(rows[0]?.video.manifest.encryptedMetadata).toBe(
+      fixture.video.manifest.encryptedMetadata,
+    );
+    expect(JSON.stringify(fetcher.mock.calls)).not.toContain(enteredKey);
+  });
+
+  it("uses the validated record context when no library descriptor is available", async () => {
+    const { key, descriptor } = await libraryFixture();
+    const fixture = await videoFixture(key, descriptor.id);
+
+    await expect(openLibraryVideo(fixture.video, key, null)).resolves.toEqual({
+      metadata: fixture.metadata,
+      credentials: fixture.credentials,
+    });
   });
 
   it("reports an expired session before attempting to parse its response as catalog data", async () => {

@@ -8,6 +8,7 @@ import {
   readBody,
   requireContentType,
   requireOrigin,
+  requireWritableLibrary,
 } from "@/lib/server/http";
 import {
   expectedChunkLength,
@@ -29,7 +30,8 @@ async function parseParams(context: ChunkContext) {
 export async function PUT(request: NextRequest, context: ChunkContext) {
   return handleApi(async () => {
     const config = getConfig();
-    requireLibrarySession(request, config);
+    requireWritableLibrary(config);
+    await requireLibrarySession(request, config);
     requireOrigin(request, config);
     requireContentType(request, "application/octet-stream");
     const { id, index } = await parseParams(context);
@@ -51,7 +53,7 @@ export async function PUT(request: NextRequest, context: ChunkContext) {
 export async function GET(request: NextRequest, context: ChunkContext) {
   return handleApi(async () => {
     const config = getConfig();
-    requireLibrarySession(request, config);
+    await requireLibrarySession(request, config);
     const { id, index } = await parseParams(context);
     return withStorage(config, async (storage) => {
       const packet = await storage.readChunk(id, index);

@@ -27,14 +27,16 @@ import {
 } from "@/lib/video/schema";
 
 const origin = "https://example.com";
-const password = "sample-library-password";
 let directory: string;
+let libraryKey: string;
 
 beforeEach(async () => {
   vi.resetModules();
   directory = await mkdtemp(join(tmpdir(), "eeevp-worker-route-"));
+  libraryKey = createLibraryKey();
   vi.stubEnv("APP_ORIGIN", origin);
-  vi.stubEnv("LIBRARY_PASSWORD", password);
+  vi.stubEnv("DEMO_MODE", "false");
+  vi.stubEnv("STORAGE_DRIVER", "filesystem");
   vi.stubEnv(
     "SESSION_SECRET",
     "sample-session-secret-for-tests-only-123456789",
@@ -49,19 +51,26 @@ afterEach(async () => {
 });
 
 describe("upload worker and real route contract", () => {
-  it("encrypts bounded chunks and completes through the bodyless finalization endpoint", async () => {
+  it.each([
+    {
+      scenario: "completes after each chunk is acknowledged",
+      failFirstChunk: false,
+    },
+    {
+      scenario: "stops reading and encrypting after the first failed chunk",
+      failFirstChunk: true,
+    },
+  ])("bounds upload memory and $scenario", async ({ failFirstChunk }) => {
     const session = await signIn(
       new NextRequest(`${origin}/api/session`, {
         method: "POST",
         headers: { origin, "Content-Type": "application/json" },
-        body: JSON.stringify({ password }),
+        body: "{}",
       }),
     );
     expect(session.status).toBe(200);
     const cookie = session.headers.get("set-cookie")?.split(";", 1)[0];
-    if (!cookie)
-      throw new Error("A real authenticated upload session is required.");
-    const libraryKey = createLibraryKey();
+    if (!cookie) throw new Error("A real browser session is required.");
     const library = await createLibraryDescriptor(libraryKey);
     const initialized = await initializeLibrary(
       new NextRequest(`${origin}/api/library`, {
@@ -73,6 +82,8 @@ describe("upload worker and real route contract", () => {
     expect(initialized.status).toBe(201);
 
     const requests: Array<{ path: string; init: RequestInit }> = [];
+    const firstChunkStarted = Promise.withResolvers<void>();
+    const releaseFirstChunk = Promise.withResolvers<void>();
     const messages: unknown[] = [];
     const handlers: Array<(event: MessageEvent<unknown>) => Promise<void>> = [];
     let closed = false;
@@ -110,6 +121,11 @@ describe("upload worker and real route contract", () => {
       const chunk = /^\/api\/videos\/([^/]+)\/chunks\/(\d+)$/.exec(path);
       if (chunk) {
         const [, id, index] = chunk;
+        if (index === "0") {
+          firstChunkStarted.resolve();
+          await releaseFirstChunk.promise;
+          if (failFirstChunk) return new Response(null, { status: 503 });
+        }
         return uploadChunk(request, { params: Promise.resolve({ id, index }) });
       }
       const finalization = /^\/api\/videos\/([^/]+)\/complete$/.exec(path);
@@ -135,11 +151,75 @@ describe("upload worker and real route contract", () => {
       (_, index) => index % 251,
     );
     const file = new File([bytes], "sample-video.webm", { type: "video/webm" });
-    await receive(
+    const slices = vi.spyOn(file, "slice");
+    const wholeFile = vi.spyOn(file, "arrayBuffer");
+    const uploading = receive(
       new MessageEvent("message", {
         data: { type: "upload", file, libraryKey, library },
       }),
     );
+    try {
+      await firstChunkStarted.promise;
+      expect(slices).toHaveBeenCalledExactlyOnceWith(0, CHUNK_SIZE);
+      expect(wholeFile).not.toHaveBeenCalled();
+      expect(requests.filter(({ init }) => init.method === "PUT")).toHaveLength(
+        1,
+      );
+      expect(messages).toEqual([
+        {
+          type: "progress",
+          phase: "encrypting",
+          completed: 0,
+          total: file.size,
+        },
+        {
+          type: "progress",
+          phase: "uploading",
+          completed: 0,
+          total: file.size,
+        },
+      ]);
+      expect(closed).toBe(false);
+    } finally {
+      releaseFirstChunk.resolve();
+      await uploading;
+    }
+    const draftBody = requests[0]?.init.body;
+    expect(typeof draftBody).toBe("string");
+    expect(draftBody).not.toContain(libraryKey);
+    expect(draftBody).not.toContain(file.name);
+    expect(draftBody).not.toContain(file.type);
+    if (failFirstChunk) {
+      expect(slices).toHaveBeenCalledExactlyOnceWith(0, CHUNK_SIZE);
+      expect(wholeFile).not.toHaveBeenCalled();
+      expect(requests.map(({ init }) => init.method)).toEqual(["POST", "PUT"]);
+      expect(messages).toEqual([
+        {
+          type: "progress",
+          phase: "encrypting",
+          completed: 0,
+          total: file.size,
+        },
+        {
+          type: "progress",
+          phase: "uploading",
+          completed: 0,
+          total: file.size,
+        },
+        {
+          type: "error",
+          message:
+            "Uploading an encrypted chunk failed (HTTP 503). Please try again.",
+        },
+      ]);
+      expect(closed).toBe(true);
+      return;
+    }
+    expect(slices.mock.calls).toEqual([
+      [0, CHUNK_SIZE],
+      [CHUNK_SIZE, file.size],
+    ]);
+    expect(wholeFile).not.toHaveBeenCalled();
 
     const result = z
       .strictObject({
@@ -211,49 +291,78 @@ describe("upload worker and real route contract", () => {
     }
   });
 
-  it("rejects an incorrect library key before sending a request and closes its key-holding realm", async () => {
-    const library = await createLibraryDescriptor(createLibraryKey());
-    const messages: unknown[] = [];
-    const handlers: Array<(event: MessageEvent<unknown>) => Promise<void>> = [];
-    let closed = false;
-    vi.stubGlobal("self", {
-      postMessage(message: unknown) {
-        messages.push(message);
-      },
-      close() {
-        closed = true;
-      },
-      addEventListener(
-        _type: string,
-        handler: (event: MessageEvent<unknown>) => Promise<void>,
-      ) {
-        handlers.push(handler);
-      },
-    });
-    const network = vi.fn(async () => {
-      throw new Error(
-        "The network must not be reached with a wrong library key.",
-      );
-    });
-    vi.stubGlobal("fetch", network);
-    await import("@/workers/upload-worker");
-    const receive = handlers.at(0);
-    if (!receive)
-      throw new Error(
-        "The upload worker did not register its message handler.",
-      );
-    await receive(
-      new MessageEvent("message", {
-        data: {
-          type: "upload",
-          file: new File(["sample"], "sample.mp4", { type: "video/mp4" }),
-          libraryKey: createLibraryKey(),
-          library,
+  it.each([
+    {
+      scenario: "incorrect canonical key",
+      malformedKey: false,
+      validFile: true,
+      expectedMessage: null,
+    },
+    {
+      scenario: "noncanonical entered key",
+      malformedKey: true,
+      validFile: true,
+      expectedMessage: "This encryption key cannot add videos to the library.",
+    },
+    {
+      scenario: "invalid file",
+      malformedKey: false,
+      validFile: false,
+      expectedMessage: "Choose a valid video file before uploading.",
+    },
+  ])(
+    "rejects $scenario before sending a request and closes its key-holding realm",
+    async ({ malformedKey, validFile, expectedMessage }) => {
+      const library = await createLibraryDescriptor(createLibraryKey());
+      const messages: unknown[] = [];
+      const handlers: Array<(event: MessageEvent<unknown>) => Promise<void>> =
+        [];
+      let closed = false;
+      vi.stubGlobal("self", {
+        postMessage(message: unknown) {
+          messages.push(message);
         },
-      }),
-    );
-    expect(network).not.toHaveBeenCalled();
-    expect(closed).toBe(true);
-    expect(messages).toEqual([{ type: "error", message: expect.any(String) }]);
-  });
+        close() {
+          closed = true;
+        },
+        addEventListener(
+          _type: string,
+          handler: (event: MessageEvent<unknown>) => Promise<void>,
+        ) {
+          handlers.push(handler);
+        },
+      });
+      const network = vi.fn(async () => {
+        throw new Error(
+          "The network must not be reached with a wrong library key.",
+        );
+      });
+      vi.stubGlobal("fetch", network);
+      await import("@/workers/upload-worker");
+      const receive = handlers.at(0);
+      if (!receive)
+        throw new Error(
+          "The upload worker did not register its message handler.",
+        );
+      await receive(
+        new MessageEvent("message", {
+          data: {
+            type: "upload",
+            file: validFile
+              ? new File(["sample"], "sample.mp4", { type: "video/mp4" })
+              : { name: "sample.mp4", type: "video/mp4" },
+            libraryKey: malformedKey
+              ? "not-an-encryption-key"
+              : createLibraryKey(),
+            library,
+          },
+        }),
+      );
+      expect(network).not.toHaveBeenCalled();
+      expect(closed).toBe(true);
+      expect(messages).toEqual([
+        { type: "error", message: expectedMessage ?? expect.any(String) },
+      ]);
+    },
+  );
 });

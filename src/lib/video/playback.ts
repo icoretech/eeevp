@@ -1,4 +1,6 @@
 // Open a browser-owned streaming session and release its worker-held key when playback closes.
+
+import { createDecryptionActivity } from "./decryption-activity";
 import type { VideoCredentials, VideoManifest, VideoMetadata } from "./schema";
 
 const STARTUP_TIMEOUT = 20_000;
@@ -17,6 +19,10 @@ export class PlaybackSessionExpired extends Error {
 
 function abortError() {
   return new DOMException("Playback opening was cancelled.", "AbortError");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function abortable<T>(promise: Promise<T>, signal: AbortSignal) {
@@ -153,6 +159,7 @@ export async function openPlayback(
   const sessionId = crypto.randomUUID();
   const startup = new AbortController();
   const disconnected = new AbortController();
+  const activity = createDecryptionActivity(manifest.size, manifest.chunkCount);
   let worker: ServiceWorker | undefined;
   let closed = false;
   const timeout = window.setTimeout(() => {
@@ -180,9 +187,26 @@ export async function openPlayback(
       typeof data !== "object" ||
       data === null ||
       !("type" in data) ||
-      data.type !== "playback-error" ||
       !("sessionId" in data) ||
       data.sessionId !== sessionId ||
+      closed
+    )
+      return;
+    if (data.type === "playback-resume") {
+      const port = event.ports[0];
+      if (!port) return;
+      port.postMessage({
+        type: "unlock",
+        sessionId,
+        manifest,
+        credentials,
+        metadata,
+      });
+      port.close();
+      return;
+    }
+    if (
+      data.type !== "playback-error" ||
       !("code" in data) ||
       data.code !== "session-expired"
     )
@@ -191,6 +215,32 @@ export async function openPlayback(
     disconnected.abort(reason);
     startup.abort(reason);
     close();
+  };
+  const activityMessage = (event: MessageEvent<unknown>) => {
+    if (
+      event.source !== worker ||
+      event.origin !== window.location.origin ||
+      closed ||
+      !isRecord(event.data) ||
+      event.data.type !== "decryption-activity" ||
+      event.data.sessionId !== sessionId ||
+      typeof event.data.index !== "number" ||
+      !Number.isInteger(event.data.index) ||
+      typeof event.data.plaintextBytes !== "number" ||
+      !Number.isInteger(event.data.plaintextBytes) ||
+      event.data.phase !== "verified"
+    )
+      return;
+    const index = event.data.index;
+    const plaintextBytes = event.data.plaintextBytes;
+    if (
+      index < 0 ||
+      index >= manifest.chunkCount ||
+      plaintextBytes !==
+        Math.min(manifest.chunkSize, manifest.size - index * manifest.chunkSize)
+    )
+      return;
+    activity.record({ sessionId, index, plaintextBytes, phase: "verified" });
   };
   const close = () => {
     if (closed) return;
@@ -201,6 +251,8 @@ export async function openPlayback(
     window.removeEventListener("pagehide", close);
     navigator.serviceWorker.removeEventListener("controllerchange", changed);
     navigator.serviceWorker.removeEventListener("message", failed);
+    navigator.serviceWorker.removeEventListener("message", activityMessage);
+    activity.close();
     try {
       worker?.postMessage({ type: "lock", sessionId });
     } catch {
@@ -220,6 +272,7 @@ export async function openPlayback(
     worker = await waitForController(startup.signal);
     navigator.serviceWorker.addEventListener("controllerchange", changed);
     navigator.serviceWorker.addEventListener("message", failed);
+    navigator.serviceWorker.addEventListener("message", activityMessage);
     changed();
     await unlock(
       worker,
@@ -233,6 +286,7 @@ export async function openPlayback(
         .href,
       close,
       disconnected: disconnected.signal,
+      activity,
     };
   } catch (error) {
     close();

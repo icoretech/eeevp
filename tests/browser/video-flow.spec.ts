@@ -1,17 +1,12 @@
-// Real browser acceptance for the authenticated library and browser-only master key.
+// Real browser acceptance preserves the existing private library and deletes only its own synthetic upload.
+import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
-import {
-  mkdir,
-  readdir,
-  readFile,
-  rm,
-  rmdir,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { expect, type Page, type Request, test } from "@playwright/test";
 import { z } from "zod";
+import { normalizeLibraryKeyInput } from "../../src/lib/crypto/key-input";
 import {
   libraryDescriptorSchema,
   libraryVideoSchema,
@@ -72,8 +67,38 @@ async function screenshot(page: Page, path: string) {
   await page.screenshot({
     path,
     fullPage: true,
-    mask: [page.locator("input")],
+    mask: [page.locator('input[type="password"]')],
   });
+}
+
+// A disposable loopback origin observes the browser's real referrer behavior without external services.
+async function crossOriginReferrerIsSuppressed(page: Page) {
+  let received = false;
+  let referrer: string | undefined;
+  const probe = createServer((request, response) => {
+    received = true;
+    referrer = request.headers.referer;
+    response.writeHead(204, { "Cache-Control": "no-store" });
+    response.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = probe.address();
+    if (!address || typeof address === "string")
+      throw new Error("Referrer probe did not bind a TCP port");
+    await page.evaluate(async (target) => {
+      await fetch(target, { mode: "no-cors", cache: "no-store" });
+    }, `http://127.0.0.1:${address.port}/referrer-probe`);
+    expect(received).toBe(true);
+    expect(referrer).toBeUndefined();
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      probe.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
 }
 
 async function noOverflow(page: Page) {
@@ -84,16 +109,51 @@ async function noOverflow(page: Page) {
   ).toBe(true);
 }
 
-async function signIn(page: Page, password: string) {
-  await page.getByLabel("Library password", { exact: true }).fill(password);
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
-}
-
-async function unlock(page: Page, key: string) {
-  await page.getByLabel("Library key", { exact: true }).fill(key);
+async function signIn(page: Page, recoveryText: string, key: string) {
+  const input = page.getByLabel("Encryption key", { exact: true });
+  await expect(input).toBeVisible();
+  await expect(
+    page.getByLabel("Library password", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Unlock library", exact: true }),
+  ).toHaveCount(0);
+  const advanced = page.getByRole("button", {
+    name: "Advanced key tools",
+    exact: true,
+  });
+  if ((await advanced.getAttribute("aria-expanded")) !== "true")
+    await advanced.click();
+  await expect(
+    page.getByLabel("Import .txt recovery file", { exact: true }),
+  ).toBeVisible();
+  let importRequests = 0;
+  const observeImport = (request: Request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/"))
+      importRequests += 1;
+  };
+  page.on("request", observeImport);
+  try {
+    await page
+      .getByLabel("Import .txt recovery file", { exact: true })
+      .setInputFiles({
+        name: "library-recovery.txt",
+        mimeType: "text/plain",
+        buffer: Buffer.from(recoveryText),
+      });
+    await expect
+      .poll(async () => (await input.inputValue()) === key)
+      .toBe(true);
+  } finally {
+    page.off("request", observeImport);
+  }
+  expect(importRequests).toBe(0);
   await page
-    .getByRole("button", { name: "Unlock library", exact: true })
+    .getByRole("button", { name: "Decrypt & Login", exact: true })
     .click();
+  await expect(
+    page.getByRole("button", { name: "Lock library", exact: true }),
+  ).toBeVisible();
 }
 
 async function catalog(page: Page) {
@@ -127,16 +187,20 @@ async function lockedApiStatuses(page: Page, id: string) {
 
 async function noPersistentKey(page: Page, key: string) {
   const persisted = await page.evaluate(
-    async (candidate) => ({
+    async (secrets) => ({
       keyInLocalStorage: Object.values(localStorage).some(
-        (value) => typeof value === "string" && value.includes(candidate),
+        (value) =>
+          typeof value === "string" &&
+          secrets.some((secret) => value.includes(secret)),
       ),
       keyInSessionStorage: Object.values(sessionStorage).some(
-        (value) => typeof value === "string" && value.includes(candidate),
+        (value) =>
+          typeof value === "string" &&
+          secrets.some((secret) => value.includes(secret)),
       ),
       indexedDatabases: (await indexedDB.databases()).length,
     }),
-    key,
+    [key],
   );
   expect(persisted).toEqual({
     keyInLocalStorage: false,
@@ -154,30 +218,45 @@ async function noSharingSurface(page: Page) {
   expect(new URL(page.url()).search).toBe("");
 }
 
-test("private library across devices with memory-only keys and streaming playback", async ({
+test("browser key opens the catalog across devices and decrypts only with the correct key", async ({
   browser,
   page,
   context,
   baseURL,
 }, info) => {
-  // First-use setup must never run against an existing library or a remote deployment.
   if (!baseURL || new URL(baseURL).hostname !== "localhost")
+    throw new Error("Acceptance requires the coordinated local preview");
+  if (process.env.STORAGE_DRIVER !== "filesystem")
     throw new Error(
-      "First-use acceptance requires an isolated localhost library",
+      "This acceptance requires the coordinated filesystem preview",
     );
   const storage = process.env.STORAGE_PATH;
-  const password = process.env.LIBRARY_PASSWORD;
-  if (!storage || !password)
-    throw new Error("Compose must supply STORAGE_PATH and LIBRARY_PASSWORD");
-  const existing = await readdir(storage).catch((error: unknown) => {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT")
-      return [];
-    throw error;
-  });
-  if (existing.length !== 0)
+  const recoveryText = process.env.EEEVP_BROWSER_RECOVERY_TEXT;
+  if (!storage || !recoveryText)
     throw new Error(
-      "First-use acceptance requires an empty dedicated STORAGE_PATH; existing files are preserved",
+      "Provide existing recovery text through run-private-library.mjs stdin; STORAGE_PATH is required",
     );
+  const key = normalizeLibraryKeyInput(recoveryText);
+  const descriptorPath = join(storage, "library.json");
+  const originalDescriptor = await readFile(descriptorPath);
+  const descriptor = libraryDescriptorSchema.parse(
+    JSON.parse(originalDescriptor.toString("utf8")),
+  );
+  const existing = new Set(await readdir(join(storage, "videos")));
+  const existingManifests = new Map<string, Buffer>();
+  for (const id of existing) {
+    try {
+      existingManifests.set(
+        id,
+        await readFile(join(storage, "videos", id, "manifest.json")),
+      );
+    } catch (error) {
+      if (
+        !(error instanceof Error && "code" in error && error.code === "ENOENT")
+      )
+        throw error;
+    }
+  }
   await mkdir(info.outputDir, { recursive: true });
   const actions: string[] = [];
   const recordAction = (message: string) => {
@@ -191,99 +270,97 @@ test("private library across devices with memory-only keys and streaming playbac
   const requests: Request[] = [];
   const workers: string[] = [];
   const createdIds = new Set<string>();
-  let initializedId: string | undefined;
+  const filename = `qa-video-${randomUUID()}.webm`;
+  const trackOwnedUpload = (request: Request) => {
+    const path = new URL(request.url()).pathname;
+    if (request.method() === "POST" && path === "/api/videos") {
+      const rawBody = request.postData();
+      if (!rawBody) return;
+      let body: unknown;
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        return;
+      }
+      const record = z
+        .object({ manifest: z.object({ id: z.uuid() }) })
+        .safeParse(body);
+      if (record.success && !existing.has(record.data.manifest.id))
+        createdIds.add(record.data.manifest.id);
+    }
+  };
   context.on("request", (request) => {
     requests.push(request);
-    if (request.method() === "PUT") {
-      const match = new URL(request.url()).pathname.match(
-        /^\/api\/videos\/([a-f0-9-]+)\/chunks\/\d+$/,
-      );
-      if (match?.[1]) createdIds.add(match[1]);
-    }
+    trackOwnedUpload(request);
   });
   page.on("worker", (worker) => workers.push(worker.url()));
   const viewer = await browser.newContext({
     viewport: { width: 1440, height: 1000 },
   });
   viewer.on("request", (request) => requests.push(request));
+  const invalidViewer = await browser.newContext({
+    viewport: { width: 1440, height: 1000 },
+  });
+  const invalidRequests: Request[] = [];
+  invalidViewer.on("request", (request) => {
+    requests.push(request);
+    invalidRequests.push(request);
+    trackOwnedUpload(request);
+  });
+  const wrongKey = "not-the-video-key";
   try {
-    await page.goto("/");
+    const navigation = await page.goto("/");
+    if (!navigation) throw new Error("Initial document response missing");
+    expect(navigation.headers()["referrer-policy"]).toBe("same-origin");
+    await expect(page.locator('meta[name="referrer"]')).toHaveAttribute(
+      "content",
+      "same-origin",
+    );
+    await crossOriginReferrerIsSuppressed(page);
+    recordAction(
+      "Document header and meta both use same-origin; an actual request to a second loopback origin sends no Referer",
+    );
     await expect(
-      page.getByLabel("Library password", { exact: true }),
+      page.getByLabel("Encryption key", { exact: true }),
     ).toBeVisible();
     expect(
       await lockedApiStatuses(page, "00000000-0000-4000-8000-000000000001"),
     ).toEqual([401, 401, 401, 401]);
-    await signIn(page, "incorrect-library-password");
-    await expect(
-      page.getByRole("alert").filter({ hasText: /incorrect|invalid|wrong/i }),
-    ).toBeVisible();
-    await expect(
-      page.getByLabel("Library password", { exact: true }),
-    ).toBeVisible();
-    recordAction(
-      "Public library gate blocks unauthenticated access; descriptor/catalog/manifest/chunk reads all401; incorrect password rejected",
-    );
-    await signIn(page, password);
-    await page
-      .getByRole("button", { name: "Create library key", exact: true })
-      .click();
-    const key = await page
-      .getByLabel("Your library key", { exact: true })
-      .inputValue();
-    expect(Buffer.from(key, "base64url").length).toBe(32);
-    const initialize = page.getByRole("button", {
-      name: "Initialize library",
-      exact: true,
-    });
-    await expect(initialize).toBeDisabled();
-    await page
-      .getByRole("checkbox", { name: "I saved my library key", exact: true })
-      .check();
-    const initialization = page.waitForResponse(
-      (response) =>
-        new URL(response.url()).pathname === "/api/library" &&
-        response.request().method() === "POST",
-    );
-    await initialize.click();
-    const initialized = await initialization;
-    expect(initialized.status()).toBe(201);
-    const initializedBody: unknown = await initialized.json();
-    initializedId = z
-      .strictObject({ library: libraryDescriptorSchema })
-      .parse(initializedBody).library.id;
-    await expect(
-      page.getByRole("button", { name: "Lock library", exact: true }),
-    ).toBeVisible();
+    await screenshot(page, info.outputPath("single-key-login.png"));
+    await signIn(page, recoveryText, key);
+    const baseline = await catalog(page);
+    expect(
+      baseline.every((entry) => existingManifests.has(entry.manifest.id)),
+    ).toBe(true);
     await noSharingSurface(page);
     await noPersistentKey(page, key);
     recordAction(
-      "First-use key generated in browser; initialization disabled before recovery acknowledgement; immutable descriptor created only after confirmation",
+      "Local recovery file fills the sole Encryption key field without an API request; empty session payload opens the catalog and correct key decrypts metadata",
     );
-    await screenshot(page, info.outputPath("desktop-empty-library.png"));
     const fixture = await syntheticVideo(page);
     await writeFile(info.outputPath("sample-video.webm"), fixture);
     expect(fixture.length).toBeGreaterThan(2 * 1_048_576);
     await page.getByLabel("Choose your video", { exact: true }).setInputFiles({
-      name: "sample-video.webm",
+      name: filename,
       mimeType: "video/webm",
       buffer: fixture,
     });
     await page
       .getByRole("button", { name: "Encrypt & upload", exact: true })
       .click();
-    await expect(
-      page.locator(".catalog-card").filter({ hasText: "sample-video.webm" }),
-    ).toBeVisible({ timeout: 60_000 });
-    const records = await catalog(page);
-    expect(records).toHaveLength(1);
-    const record = records[0];
-    if (!record) throw new Error("Uploaded record missing");
-    const id = record.manifest.id;
-    createdIds.add(id);
-    expect(record.libraryId).toBe(initializedId);
+    const ownCard = page.locator(".catalog-card").filter({ hasText: filename });
+    await expect(ownCard).toBeVisible({ timeout: 60_000 });
+    expect(createdIds.size).toBe(1);
+    const id = createdIds.values().next().value;
+    if (!id) throw new Error("Owned upload identifier missing");
+    const record = (await catalog(page)).find(
+      (entry) => entry.manifest.id === id,
+    );
+    if (!record)
+      throw new Error("Uploaded record missing from canonical catalog");
+    expect(record.libraryId).toBe(descriptor.id);
     expect(record.wrappedKey.length).toBe(80);
-    expect(JSON.stringify(records).includes("sample-video.webm")).toBe(false);
+    expect(JSON.stringify(record).includes(filename)).toBe(false);
     expect(workers.length).toBeGreaterThan(0);
     const stored = await readFile(join(storage, "videos", id, "chunks", "0"));
     expect(stored.length).toBe(1_048_576 + 28);
@@ -292,11 +369,12 @@ test("private library across devices with memory-only keys and streaming playbac
       join(storage, "videos", id, "manifest.json"),
       "utf8",
     );
-    expect(diskRecord.includes("sample-video.webm")).toBe(false);
+    expect(diskRecord.includes(filename)).toBe(false);
     expect(diskRecord.includes(key)).toBe(false);
     recordAction(
-      `UI worker upload persisted ${fixture.length} bytes as bounded ciphertext; canonical authenticated catalog contains encrypted metadata and wrapped key`,
+      `Owned synthetic upload persists ${fixture.length} bytes as bounded ciphertext with wrapped key and encrypted filename`,
     );
+    await page.getByLabel("Search videos", { exact: true }).fill(filename);
     await noSharingSurface(page);
     await screenshot(page, info.outputPath("desktop-library.png"));
     await page.setViewportSize({ width: 390, height: 844 });
@@ -304,54 +382,109 @@ test("private library across devices with memory-only keys and streaming playbac
     await screenshot(page, info.outputPath("mobile-library.png"));
     await page.setViewportSize({ width: 1440, height: 1000 });
 
+    const opaquePage = await invalidViewer.newPage();
+    await opaquePage.goto(baseURL);
+    await opaquePage
+      .getByLabel("Encryption key", { exact: true })
+      .fill(wrongKey);
+    await opaquePage
+      .getByRole("button", { name: "Decrypt & Login", exact: true })
+      .click();
+    await expect(
+      opaquePage.getByRole("button", { name: "Lock library", exact: true }),
+    ).toBeVisible();
+    const opaqueCard = opaquePage
+      .locator(".catalog-card")
+      .filter({ hasText: record.manifest.encryptedMetadata.slice(0, 56) });
+    await expect(opaqueCard).toBeVisible();
+    await expect(
+      opaqueCard.getByText("Encrypted metadata", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      opaqueCard.getByRole("button", { name: "Watch video", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      opaqueCard.getByRole("button", {
+        name: "Delete encrypted video",
+        exact: true,
+      }),
+    ).toBeDisabled();
+    await expect(opaquePage.getByText(filename, { exact: true })).toHaveCount(
+      0,
+    );
+    expect(
+      (await catalog(opaquePage)).some((entry) => entry.manifest.id === id),
+    ).toBe(true);
+    await screenshot(
+      opaquePage,
+      info.outputPath("wrong-key-opaque-catalog.png"),
+    );
+    await opaquePage
+      .getByLabel("Choose your video", { exact: true })
+      .setInputFiles({
+        name: "rejected-video.webm",
+        mimeType: "video/webm",
+        buffer: fixture,
+      });
+    await opaquePage
+      .getByRole("button", { name: "Encrypt & upload", exact: true })
+      .click();
+    await expect(
+      opaquePage.getByText("Upload needs attention", { exact: true }),
+    ).toBeVisible();
+    expect(
+      invalidRequests.filter(
+        (request) =>
+          request.method() === "POST" &&
+          new URL(request.url()).pathname === "/api/videos",
+      ),
+    ).toHaveLength(0);
+    await opaquePage.goto(`${baseURL}/watch/${id}`);
+    await opaquePage
+      .getByLabel("Encryption key", { exact: true })
+      .fill(wrongKey);
+    await opaquePage
+      .getByRole("button", { name: "Decrypt & Login", exact: true })
+      .click();
+    await expect(
+      opaquePage.getByRole("button", { name: "Lock library", exact: true }),
+    ).toBeVisible();
+    await expect(
+      opaquePage.getByRole("heading", {
+        name: "This video could not be opened.",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(opaquePage.locator("video")).toHaveCount(0);
+    await noPersistentKey(opaquePage, wrongKey);
+    await screenshot(opaquePage, info.outputPath("wrong-key-unplayable.png"));
+    recordAction(
+      "Arbitrary nonempty wrong key enters the catalog: encrypted metadata stays opaque, watch/delete controls disabled, direct playback fails locally, and upload causes no server mutation",
+    );
+
     const watch = await viewer.newPage();
     expect(await viewer.cookies()).toHaveLength(0);
     await watch.goto(`${baseURL}/watch/${id}`);
     await expect(
-      watch.getByLabel("Library password", { exact: true }),
+      watch.getByLabel("Encryption key", { exact: true }),
     ).toBeVisible();
     expect(await lockedApiStatuses(watch, id)).toEqual([401, 401, 401, 401]);
     await watch.goto(baseURL);
-    await signIn(watch, password);
-    await expect(
-      watch.getByLabel("Library key", { exact: true }),
-    ).toBeVisible();
-    const apiCallsBeforeWrongKey = requests.filter((request) =>
-      new URL(request.url()).pathname.startsWith("/api/"),
-    ).length;
-    await unlock(watch, Buffer.alloc(32, 7).toString("base64url"));
-    await expect(
-      watch.getByRole("alert").filter({ hasText: /key|unlock/i }),
-    ).toBeVisible();
-    await expect(watch.locator("video")).toHaveCount(0);
-    await expect(
-      watch.getByLabel("Choose your video", { exact: true }),
-    ).toHaveCount(0);
-    expect(
-      requests.filter((request) =>
-        new URL(request.url()).pathname.startsWith("/api/"),
-      ).length,
-    ).toBe(apiCallsBeforeWrongKey);
-    await screenshot(watch, info.outputPath("wrong-key.png"));
-    recordAction(
-      "Second device without cookies cannot read existing video; correct server password with wrong masterkey remains locked",
-    );
-    await unlock(watch, key);
+    await signIn(watch, recoveryText, key);
     const secondDeviceCard = watch
       .locator(".catalog-card")
-      .filter({ hasText: "sample-video.webm" });
+      .filter({ hasText: filename });
     await expect(secondDeviceCard).toBeVisible();
-    expect((await catalog(watch)).map((entry) => entry.manifest.id)).toEqual([
-      id,
-    ]);
+    expect(
+      (await catalog(watch)).some((entry) => entry.manifest.id === id),
+    ).toBe(true);
     await secondDeviceCard
       .getByRole("button", { name: "Watch video", exact: true })
       .click();
     await expect(
-      watch.getByRole("heading", { name: "sample-video.webm", exact: true }),
+      watch.getByRole("heading", { name: filename, exact: true }),
     ).toBeVisible();
     const video = watch.locator("video");
-    await expect(video).toBeVisible();
     await expect
       .poll(() =>
         video.evaluate((element: HTMLVideoElement) => element.readyState),
@@ -391,7 +524,7 @@ test("private library across devices with memory-only keys and streaming playbac
     await noSharingSurface(watch);
     await noPersistentKey(watch, key);
     recordAction(
-      "Second device enters same masterkey: original filename, first SW install/control, native video decode/play and seek4s succeed with normal URL",
+      "Fresh independent browser imports the same recovery file and logs in once; canonical video plays and seeks at 4 seconds after first SW control",
     );
     await screenshot(watch, info.outputPath("desktop-playback.png"));
     await watch.setViewportSize({ width: 390, height: 844 });
@@ -414,20 +547,27 @@ test("private library across devices with memory-only keys and streaming playbac
       Buffer.from(range.bytes).equals(fixture.subarray(1_048_000, 1_049_501)),
     ).toBe(true);
     recordAction(
-      "Cross-chunk streaming range returns206 and1501 exact source bytes; no full decrypted Blob",
+      "Cross-chunk stream returns 206 and 1501 exact source bytes without a decrypted Blob",
     );
-
     await video.evaluate(async (element: HTMLVideoElement) => {
       await element.play();
     });
     await expect
       .poll(() => video.evaluate((element: HTMLVideoElement) => element.paused))
       .toBe(false);
+    const sessionCleared = watch.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/session" &&
+        response.request().method() === "DELETE",
+    );
     await watch
       .getByRole("button", { name: "Lock library", exact: true })
       .click();
+    const cleared = await sessionCleared;
+    expect(cleared.ok()).toBe(true);
+    await cleared.finished();
     await expect(
-      watch.getByLabel("Library password", { exact: true }),
+      watch.getByLabel("Encryption key", { exact: true }),
     ).toBeVisible();
     await expect(watch.locator("video")).toHaveCount(0);
     expect(await lockedApiStatuses(watch, id)).toEqual([401, 401, 401, 401]);
@@ -439,11 +579,9 @@ test("private library across devices with memory-only keys and streaming playbac
     ).toBe(403);
     await noPersistentKey(watch, key);
     recordAction(
-      "Lock clears authenticated access and playback: no video, API401, former stream403, no persistent key",
+      "Lock clears browser key, player and cookie; protected APIs return 401 and former media URL returns 403",
     );
-    await signIn(watch, password);
-    await unlock(watch, key);
-    await expect(watch.locator("video")).toBeVisible();
+    await signIn(watch, recoveryText, key);
     await expect
       .poll(() =>
         watch
@@ -467,37 +605,35 @@ test("private library across devices with memory-only keys and streaming playbac
         });
         await response.arrayBuffer();
       } catch {
-        /* Authenticated stream cancellation is expected after cookie expiry. */
+        /* Expected cancellation when the real private chunk request returns 401. */
       }
     }, expiringStream);
     await deniedChunk;
     await expect(
-      watch.getByLabel("Library password", { exact: true }),
+      watch.getByLabel("Encryption key", { exact: true }),
     ).toBeVisible();
     await expect(watch.locator("video")).toHaveCount(0);
     await noPersistentKey(watch, key);
     recordAction(
-      "Real cookie expiration during SW chunk fetch returns401 and clears browser key/playback, returning to sign-in",
+      "Actual cookie expiry during SW chunk fetch returns 401 and removes both playback and in-memory key",
     );
-    await signIn(watch, password);
-    await unlock(watch, key);
+    await signIn(watch, recoveryText, key);
     await expect(watch.locator("video")).toBeVisible();
 
     await page.reload();
-    await expect(page.getByLabel("Library key", { exact: true })).toBeVisible();
     await expect(
-      page.locator(".catalog-card").filter({ hasText: "sample-video.webm" }),
-    ).toHaveCount(0);
-    await unlock(page, key);
-    await expect(
-      page.locator(".catalog-card").filter({ hasText: "sample-video.webm" }),
+      page.getByLabel("Encryption key", { exact: true }),
     ).toBeVisible();
+    await expect(ownCard).toHaveCount(0);
+    await signIn(page, recoveryText, key);
+    await expect(ownCard).toBeVisible();
     await noPersistentKey(page, key);
     recordAction(
-      "Reload discards browser masterkey; key reentry restores canonical filesystem catalog",
+      "Reload asks only for the same encryption key; one login restores the existing catalog without a second secret",
     );
+    await page.getByLabel("Search videos", { exact: true }).fill(filename);
     await page
-      .getByRole("button", { name: /delete sample-video.webm/i })
+      .getByRole("button", { name: `Delete ${filename}`, exact: true })
       .click();
     await expect(page.getByRole("dialog")).toBeVisible();
     await screenshot(page, info.outputPath("delete-confirmation.png"));
@@ -505,37 +641,56 @@ test("private library across devices with memory-only keys and streaming playbac
       .getByRole("dialog")
       .getByRole("button", { name: "Delete permanently", exact: true })
       .click();
-    await expect(
-      page.locator(".catalog-card").filter({ hasText: "sample-video.webm" }),
-    ).toHaveCount(0);
-    expect(await catalog(page)).toHaveLength(0);
+    await expect(ownCard).toHaveCount(0);
+    const afterDelete = await catalog(page);
+    expect(afterDelete.some((entry) => entry.manifest.id === id)).toBe(false);
+    expect(
+      baseline.every((entry) =>
+        afterDelete.some(
+          (current) => current.manifest.id === entry.manifest.id,
+        ),
+      ),
+    ).toBe(true);
     expect(await readdir(join(storage, "videos"))).not.toContain(id);
     await watch.goto(baseURL);
-    // Full navigation deliberately drops the in-memory key and asks for it again.
+    await signIn(watch, recoveryText, key);
+    expect(
+      (await catalog(watch)).some((entry) => entry.manifest.id === id),
+    ).toBe(false);
     await expect(
-      watch.getByLabel("Library key", { exact: true }),
-    ).toBeVisible();
-    await unlock(watch, key);
-    await expect(
-      watch.getByRole("button", { name: "Lock library", exact: true }),
-    ).toBeVisible();
-    expect(await catalog(watch)).toHaveLength(0);
-    await expect(
-      watch.getByRole("heading", { name: "sample-video.webm", exact: true }),
+      watch.locator(".catalog-card").filter({ hasText: filename }),
     ).toHaveCount(0);
     recordAction(
-      "Confirmed delete removes canonical video directory and record; both authenticated clients see empty library after refresh",
+      "Confirmed deletion removes only the owned QA video from both browsers and disk; pre-existing library entries remain",
     );
 
     let uploads = 0;
     let downloads = 0;
+    let logins = 0;
     for (const request of requests) {
       expect(request.url().includes(key)).toBe(false);
+      expect(request.url().includes(wrongKey)).toBe(false);
       expect(JSON.stringify(request.headers()).includes(key)).toBe(false);
+      expect(JSON.stringify(request.headers()).includes(wrongKey)).toBe(false);
+      expect(
+        request.postDataBuffer()?.includes(Buffer.from(wrongKey)) ?? false,
+      ).toBe(false);
       expect(
         request.postDataBuffer()?.includes(Buffer.from(key)) ?? false,
       ).toBe(false);
-      if (/\/chunks\/\d+$/.test(request.url())) {
+      expect(
+        request.postDataBuffer()?.includes(Buffer.from(key, "base64url")) ??
+          false,
+      ).toBe(false);
+      const path = new URL(request.url()).pathname;
+      if (path === "/api/session" && request.method() === "POST") {
+        z.strictObject({}).parse(request.postDataJSON());
+        expect((await request.allHeaders()).origin).toBe(
+          new URL(baseURL).origin,
+        );
+        logins += 1;
+      }
+      if (/\/chunks\/\d+$/.test(path)) {
         if (request.method() === "PUT") {
           uploads += 1;
           expect(request.postDataBuffer()?.length).toBeLessThanOrEqual(
@@ -545,33 +700,38 @@ test("private library across devices with memory-only keys and streaming playbac
         if (request.method() === "GET") downloads += 1;
       }
     }
+    expect(logins).toBeGreaterThanOrEqual(5);
     expect(uploads).toBeGreaterThanOrEqual(3);
     expect(downloads).toBeGreaterThan(0);
     recordAction(
-      `${requests.length} outgoing requests contain no generated masterkey in URL/headers/body; ${uploads} bounded encrypted uploads; ${downloads} encrypted reads`,
-    );
-    await writeFile(
-      info.outputPath("acceptance-actions.json"),
-      JSON.stringify({ verdict: "PASS", actions }, null, 2),
+      `${requests.length} requests contain no raw encryption key; ${logins} session requests contain only an empty object with the actual same-origin Origin header; ${uploads} bounded encrypted uploads and ${downloads} encrypted reads`,
     );
   } finally {
-    await viewer.close();
-    // Only records created by this test are removed; all pre-existing data was rejected above.
-    for (const id of createdIds)
-      await rm(join(storage, "videos", id), { recursive: true, force: true });
-    if (initializedId) {
-      const descriptor = libraryDescriptorSchema.parse(
-        JSON.parse(await readFile(join(storage, "library.json"), "utf8")),
+    try {
+      await Promise.all([viewer.close(), invalidViewer.close()]);
+    } finally {
+      for (const id of createdIds)
+        if (!existing.has(id))
+          await rm(join(storage, "videos", id), {
+            recursive: true,
+            force: true,
+          });
+      expect((await readFile(descriptorPath)).equals(originalDescriptor)).toBe(
+        true,
       );
-      if (descriptor.id === initializedId)
-        await unlink(join(storage, "library.json"));
-    }
-    // Remove an empty test-created catalog directory so the next first-use run can start cleanly.
-    for (const directory of ["videos", ".trash"]) {
-      const remaining = await readdir(join(storage, directory)).catch(() => [
-        "unavailable",
-      ]);
-      if (remaining.length === 0) await rmdir(join(storage, directory));
+      for (const [id, original] of existingManifests)
+        expect(
+          (await readFile(join(storage, "videos", id, "manifest.json"))).equals(
+            original,
+          ),
+        ).toBe(true);
     }
   }
+  recordAction(
+    "Existing library descriptor and committed manifest bytes preserved; only test-owned upload cleaned up",
+  );
+  await writeFile(
+    info.outputPath("acceptance-actions.json"),
+    JSON.stringify({ verdict: "PASS", actions }, null, 2),
+  );
 });

@@ -1,4 +1,4 @@
-// A browser-only master key authenticates the private library and wraps independently generated video keys.
+// A browser-only library key protects encrypted library data and wraps independently generated video keys.
 import {
   credentialsSchema,
   type LibraryDescriptor,

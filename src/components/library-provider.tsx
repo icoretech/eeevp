@@ -1,71 +1,140 @@
 "use client";
 
-// The root provider keeps the library key in memory and coordinates private browser resources.
+// The workspace accepts a browser-held key without checking it; encrypted records are opened locally when used.
 import {
+  addTransitionType,
   createContext,
   type ReactNode,
+  startTransition,
   use,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { z } from "zod";
-import {
-  createLibraryDescriptor,
-  verifyLibraryKey,
-} from "@/lib/crypto/library-crypto";
+import { normalizeLibraryKeyInput } from "@/lib/crypto/key-input";
+import { createLibraryDescriptor } from "@/lib/crypto/library-crypto";
 import {
   type LibraryDescriptor,
   libraryDescriptorSchema,
 } from "@/lib/video/schema";
 
 type LibraryState = {
-  status: "loading" | "signed-out" | "needs-setup" | "locked" | "unlocked";
+  status: "signed-out" | "locked" | "open";
   library: LibraryDescriptor | null;
   libraryKey: string | null;
   error: string | null;
 };
 
-type LibraryContextValue = LibraryState & {
-  authenticate: (password: string) => Promise<void>;
-  initialize: (key: string) => Promise<void>;
-  unlock: (key: string) => Promise<void>;
-  lock: () => Promise<void>;
-  expire: () => void;
-  registerCleanup: (cleanup: () => void) => () => void;
-};
+type DemoConfiguration =
+  | { demoMode: false; demoPublicKey: null }
+  | { demoMode: true; demoPublicKey: string };
+
+type LibraryContextValue = LibraryState &
+  DemoConfiguration & {
+    enter: (input: string) => Promise<void>;
+    retryLibrary: () => Promise<void>;
+    lock: () => Promise<void>;
+    expire: () => void;
+    registerCleanup: (cleanup: () => void) => () => void;
+  };
 
 const sessionSchema = z.strictObject({ authenticated: z.boolean() });
+const sessionErrorSchema = z.strictObject({
+  error: z.string().min(1).max(512),
+});
 const libraryResponseSchema = z.strictObject({
   library: libraryDescriptorSchema.nullable(),
 });
 const initialState: LibraryState = {
-  status: "loading",
+  status: "signed-out",
   library: null,
   libraryKey: null,
   error: null,
 };
 const LibraryContext = createContext<LibraryContextValue | null>(null);
 
+class DemoLibraryUnavailable extends Error {
+  constructor() {
+    super("The demo library has not been initialized. Please try again later.");
+    this.name = "DemoLibraryUnavailable";
+  }
+}
+
 function browserRequest(path: string, init: RequestInit = {}) {
   return fetch(path, {
+    ...init,
     mode: "same-origin",
     credentials: "same-origin",
     redirect: "error",
     cache: "no-store",
-    ...init,
   });
 }
 
 async function readLibrary(signal: AbortSignal) {
   const response = await browserRequest("/api/library", { signal });
-  if (response.status === 401) throw new Error("Session expired");
   if (!response.ok) throw new Error("Library is unavailable");
   return libraryResponseSchema.parse(await response.json()).library;
 }
 
-export function LibraryProvider({ children }: { children: ReactNode }) {
+// Entry and explicit recovery share descriptor loading without comparing the entered key.
+async function loadLibrary(
+  key: string,
+  signal: AbortSignal,
+  demoMode: boolean,
+) {
+  const library = await readLibrary(signal);
+  signal.throwIfAborted();
+  if (library) return library;
+  if (demoMode) throw new DemoLibraryUnavailable();
+  let proposed: LibraryDescriptor;
+  try {
+    proposed = await createLibraryDescriptor(key);
+  } catch {
+    signal.throwIfAborted();
+    // Inputs unsuitable for AES can still open an empty workspace without creating a descriptor.
+    return null;
+  }
+  signal.throwIfAborted();
+  const response = await browserRequest("/api/library", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(proposed),
+    signal,
+  });
+  signal.throwIfAborted();
+  if (response.status === 409) return readLibrary(signal);
+  if (response.status !== 201) throw new Error("Creation failed");
+  const created = libraryResponseSchema.parse(await response.json()).library;
+  if (
+    !created ||
+    created.id !== proposed.id ||
+    created.encryptedVerifier !== proposed.encryptedVerifier
+  ) {
+    throw new Error("Unexpected library descriptor");
+  }
+  return created;
+}
+
+async function clearSession(signal: AbortSignal) {
+  const response = await browserRequest("/api/session", {
+    method: "DELETE",
+    signal,
+  });
+  if (!response.ok) throw new Error("Sign out failed");
+  if (sessionSchema.parse(await response.json()).authenticated)
+    throw new Error("Sign out failed");
+}
+
+export function LibraryProvider({
+  children,
+  demo,
+}: {
+  children: ReactNode;
+  demo: DemoConfiguration;
+}) {
   const [state, setState] = useState<LibraryState>(initialState);
   const currentState = useRef(state);
   const revision = useRef(0);
@@ -115,168 +184,133 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
   const expire = useCallback(() => {
     beginOperation();
     commit({
-      status: "signed-out",
-      library: null,
-      libraryKey: null,
-      error: "Your session expired. Sign in again to continue.",
+      ...initialState,
+      error:
+        "Your browser session expired. Enter your encryption key to continue.",
     });
     stopResources();
   }, [beginOperation, commit, stopResources]);
 
-  const authenticate = useCallback(
-    async (password: string) => {
+  const enter = useCallback(
+    async (input: string) => {
       const operation = beginOperation();
-      commit({ ...currentState.current, error: null });
-      let signedIn = false;
+      commit(initialState);
+      stopResources();
+      let key: string;
+      try {
+        key = normalizeLibraryKeyInput(input);
+        if (!key) throw new Error("Empty encryption key");
+      } catch {
+        const message = "Enter an encryption key or a valid recovery file.";
+        commit({ ...initialState, error: message });
+        throw new Error(message);
+      }
+      let library: LibraryDescriptor | null = null;
+      let sessionOpened = false;
       try {
         const response = await browserRequest("/api/session", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password }),
+          body: JSON.stringify({}),
           signal: operation.controller.signal,
         });
-        if (response.status === 401)
-          throw new Error("Incorrect library password. Try again.");
-        if (!response.ok) throw new Error("Could not sign in. Please retry.");
-        if (!sessionSchema.parse(await response.json()).authenticated)
-          throw new Error("Could not sign in. Please retry.");
-        signedIn = true;
-        const library = await readLibrary(operation.controller.signal);
         if (!isCurrent(operation)) return;
-        commit({
-          status: library ? "locked" : "needs-setup",
-          library,
-          libraryKey: null,
-          error: null,
-        });
-      } catch (error) {
-        if (!isCurrent(operation)) return;
-        const message = signedIn
-          ? "Signed in, but library details could not be loaded. Retry signing in."
-          : error instanceof Error &&
-              error.message === "Incorrect library password. Try again."
-            ? error.message
-            : "Could not sign in. Please retry.";
-        commit({
-          status: "signed-out",
-          library: null,
-          libraryKey: null,
-          error: message,
-        });
-        throw new Error(message);
-      }
-    },
-    [beginOperation, commit, isCurrent],
-  );
-
-  const initialize = useCallback(
-    async (key: string) => {
-      if (currentState.current.status !== "needs-setup")
-        throw new Error("Sign in before initializing a library.");
-      const operation = beginOperation();
-      commit({ ...currentState.current, error: null });
-      try {
-        const library = await createLibraryDescriptor(key);
-        await verifyLibraryKey(library, key);
-        if (!isCurrent(operation)) return;
-        const response = await browserRequest("/api/library", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(library),
-          signal: operation.controller.signal,
-        });
-        if (response.status === 401) {
-          expire();
-          return;
+        if (!response.ok) {
+          const result = sessionErrorSchema.safeParse(
+            await response.json().catch(() => null),
+          );
+          throw new Error(
+            result.success
+              ? `${result.data.error} (HTTP ${response.status})`
+              : `Browser session could not be opened (HTTP ${response.status}).`,
+          );
         }
-        if (response.status === 409) {
-          const existing = await readLibrary(operation.controller.signal);
+        const session = sessionSchema.safeParse(
+          await response.json().catch(() => null),
+        );
+        if (!session.success)
+          throw new Error("The browser session response was invalid.");
+        if (!session.data.authenticated)
+          throw new Error("The browser session was not opened.");
+        sessionOpened = true;
+        library = await loadLibrary(
+          key,
+          operation.controller.signal,
+          demo.demoMode,
+        );
+        if (!isCurrent(operation)) return;
+        // Async action continuations need an explicit transition for workspace entry.
+        startTransition(() => {
           if (!isCurrent(operation)) return;
-          if (!existing) throw new Error("Library is unavailable");
-          commit({
-            status: "locked",
-            library: existing,
-            libraryKey: null,
-            error:
-              "This library was already initialized. Enter its existing library key to unlock it.",
-          });
-          return;
-        }
-        if (response.status !== 201) throw new Error("Creation failed");
-        const created = libraryResponseSchema.parse(
-          await response.json(),
-        ).library;
-        if (
-          !created ||
-          created.id !== library.id ||
-          created.encryptedVerifier !== library.encryptedVerifier
-        )
-          throw new Error("Unexpected library descriptor");
-        if (!isCurrent(operation)) return;
-        commit({
-          status: "unlocked",
-          library: created,
-          libraryKey: key,
-          error: null,
+          addTransitionType("library-open");
+          commit({ status: "open", library, libraryKey: key, error: null });
         });
-      } catch {
+      } catch (failure) {
         if (!isCurrent(operation)) return;
-        const message = "Could not initialize the library. Please retry.";
-        commit({ ...currentState.current, libraryKey: null, error: message });
-        throw new Error(message);
+        if (!sessionOpened) {
+          const message =
+            failure instanceof Error
+              ? failure.message
+              : "The browser session could not be opened. Please try again.";
+          commit({ ...initialState, error: message });
+          throw new Error(message);
+        }
+        startTransition(() => {
+          if (!isCurrent(operation)) return;
+          addTransitionType("library-open");
+          commit({
+            status: "open",
+            library,
+            libraryKey: key,
+            error:
+              failure instanceof DemoLibraryUnavailable
+                ? failure.message
+                : "The video library could not be loaded. Please try again.",
+          });
+        });
       }
     },
-    [beginOperation, commit, expire, isCurrent],
+    [beginOperation, commit, demo.demoMode, isCurrent, stopResources],
   );
 
-  const unlock = useCallback(
-    async (key: string) => {
-      const { library, status } = currentState.current;
-      if (!library || status !== "locked")
-        throw new Error("Sign in before unlocking your library.");
-      const operation = beginOperation();
-      commit({ ...currentState.current, error: null });
-      try {
-        await verifyLibraryKey(library, key);
-        if (!isCurrent(operation)) return;
-        commit({
-          status: "unlocked",
-          library,
-          libraryKey: key,
-          error: null,
-        });
-      } catch {
-        if (!isCurrent(operation)) return;
-        const message =
-          "Incorrect library key. Use the key saved when this library was created.";
-        commit({ status: "locked", library, libraryKey: null, error: message });
-        throw new Error(message);
-      }
-    },
-    [beginOperation, commit, isCurrent],
-  );
+  const retryLibrary = useCallback(async () => {
+    const snapshot = currentState.current;
+    if (snapshot.status !== "open" || !snapshot.libraryKey) return;
+    const operation = beginOperation();
+    try {
+      const library = await loadLibrary(
+        snapshot.libraryKey,
+        operation.controller.signal,
+        demo.demoMode,
+      );
+      if (!isCurrent(operation)) return;
+      commit({ ...snapshot, library, error: null });
+    } catch (failure) {
+      if (!isCurrent(operation)) return;
+      commit({
+        ...snapshot,
+        error:
+          failure instanceof DemoLibraryUnavailable
+            ? failure.message
+            : "The video library could not be loaded. Please try again.",
+      });
+    }
+  }, [beginOperation, commit, demo.demoMode, isCurrent]);
 
   const lock = useCallback(async () => {
     const operation = beginOperation();
-    const { library } = currentState.current;
     commit({
-      status: library ? "locked" : "signed-out",
-      library,
+      status: "locked",
+      library: currentState.current.library,
       libraryKey: null,
       error: null,
     });
     const closed = stopResources();
     try {
-      const response = await browserRequest("/api/session", {
-        method: "DELETE",
-        signal: operation.controller.signal,
-      });
-      if (!response.ok) throw new Error("Sign out failed");
+      await clearSession(operation.controller.signal);
       if (!isCurrent(operation)) return;
       commit({
-        status: "signed-out",
-        library: null,
-        libraryKey: null,
+        ...initialState,
         error: closed
           ? null
           : "Close this tab to finish clearing browser playback resources.",
@@ -284,71 +318,38 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
     } catch {
       if (!isCurrent(operation)) return;
       commit({
-        status: library ? "locked" : "signed-out",
-        library,
-        libraryKey: null,
+        ...initialState,
+        status: "locked",
         error:
-          "Your browser key was cleared, but server access may still be authenticated. Retry signing out.",
+          "Your key was cleared, but the browser session could not be closed. Retry locking.",
       });
     }
   }, [beginOperation, commit, isCurrent, stopResources]);
 
-  useEffect(() => {
-    const operation = beginOperation();
-    async function restoreSession() {
-      try {
-        const response = await browserRequest("/api/session", {
-          signal: operation.controller.signal,
-        });
-        if (!response.ok) throw new Error("Session is unavailable");
-        const session = sessionSchema.parse(await response.json());
-        const library = session.authenticated
-          ? await readLibrary(operation.controller.signal)
-          : null;
-        if (!isCurrent(operation)) return;
-        commit({
-          status: session.authenticated
-            ? library
-              ? "locked"
-              : "needs-setup"
-            : "signed-out",
-          library,
-          libraryKey: null,
-          error: null,
-        });
-      } catch {
-        if (!isCurrent(operation)) return;
-        commit({
-          status: "signed-out",
-          library: null,
-          libraryKey: null,
-          error: "Could not check library access. Sign in to retry.",
-        });
-      }
-    }
-    void restoreSession();
-    return () => {
+  useEffect(
+    () => () => {
       revision.current += 1;
       activeRequest.current?.abort();
+      currentState.current = initialState;
       stopResources();
-    };
-  }, [beginOperation, commit, isCurrent, stopResources]);
-
-  return (
-    <LibraryContext
-      value={{
-        ...state,
-        authenticate,
-        initialize,
-        unlock,
-        lock,
-        expire,
-        registerCleanup,
-      }}
-    >
-      {children}
-    </LibraryContext>
+    },
+    [stopResources],
   );
+
+  const context = useMemo(
+    () => ({
+      ...state,
+      ...demo,
+      enter,
+      retryLibrary,
+      lock,
+      expire,
+      registerCleanup,
+    }),
+    [state, demo, enter, retryLibrary, lock, expire, registerCleanup],
+  );
+
+  return <LibraryContext value={context}>{children}</LibraryContext>;
 }
 
 export function useLibrary() {

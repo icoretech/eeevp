@@ -1,73 +1,101 @@
 # Architecture
 
-EEEVP is a private authenticated video library. One Next.js application serves an encrypted catalog and video chunks from a durable filesystem. The browser owns the master library key, decrypts the catalog, and plays the videos.
+EEEVP is a video library with browser-held encryption keys. One Next.js application serves encrypted metadata and video chunks from durable storage. The hosted target uses Synteq Apps and one fixed Cloudflare R2 bucket; local development uses a persistent filesystem volume.
 
-## Authentication and library initialization
+## Browser workspace and session
 
-The server password grants access to the library through an eight-hour signed, HttpOnly session cookie. All catalog, video, and chunk requests require that cookie. Mutations also require the configured application origin.
+Any nonempty key opens the browser workspace. The browser sends `POST /api/session` with an empty JSON object, and the server issues a signed HttpOnly convenience-session cookie. The raw key and imported recovery file never enter that request. The server does not determine whether the key can decrypt the library.
 
-The library encryption key is separate: a random 32-byte value generated in the browser. On first use, the authenticated user explicitly creates the key, saves a recovery copy, and confirms initialization. The browser creates an encrypted verifier bound to a library identifier and format version. The server atomically creates the immutable library descriptor containing that verifier, without receiving the master key.
+`DEMO_MODE=true` is the public read-only presentation. Its required `DEMO_PUBLIC_KEY` is deliberately known and supplied at runtime to an editable prefilled field. It uses synthetic samples in a separate storage namespace. `DEMO_MODE=false` is writable local/private use with a different key and namespace; private keys are not server configuration.
 
-An initialized library requires the same master key on every device. The browser verifies the entered key against the descriptor before displaying decrypted videos or enabling uploads. The key stays in browser memory across application navigation. Reloading requires entering it again. Locking clears the key, stops active browser work, and clears the session cookie.
+The public gate offers only the editable prefilled key and login. In private mode, recovery-file import and new-key generation are under **Advanced key tools**, collapsed on initial display. Files are read or generated locally.
+
+The cookie supplies session presence and supports same-origin guards, without proving key possession. Public demo mode rejects library mutations with `403` before authentication, body parsing, or storage writes. Writable mode retains the [mutation authorization limits](security.md#session-and-mutation-limits).
+
+The active key remains in browser memory across navigation. Reloading closes the workspace; private use requires supplying the key again, while public demo mode keeps its editable prefill. Locking clears active playback key state and the cookie. Private keys and decrypted catalog data are not persisted in localStorage or IndexedDB.
+
+## Interface motion
+
+The root layout keeps the library provider and page shell mounted across App Router navigation. Native React 19.3 `ViewTransition` and Next.js Link transition types animate route changes and deferred catalog filtering without reloading the browser key. Reduced-motion preferences remove movement and delays; ordinary navigation, search, and locking remain functional without the native browser API. Locking interrupts active motion and clears the workspace rather than waiting for an animation to finish. The integration uses no experimental configuration flags or additional motion library.
 
 ## Encrypted catalog
 
-The server lists committed video records from the filesystem. Each record contains its encrypted manifest, an encrypted per-video key, library identifier, and server-generated creation date. The server is the canonical catalog for every authenticated device.
+The server lists committed records from its durable backend. Each record contains an encrypted video manifest, wrapped video key, library identifier, and creation date. The server's records are the canonical catalog for every device.
 
-The unlocked browser decrypts each per-video key under the master library key, then authenticates and decrypts its filename and media type. Search operates on these decrypted filenames locally. The application does not persist the master key, decrypted catalog, or per-video keys in browser storage.
+The browser attempts to unwrap each video's key under the entered library key, then decrypts filename and media type. A matching key reveals those values and enables playback. A wrong key still opens the catalog, showing unreadable encrypted names without playable videos. Search operates on locally decrypted filenames.
 
-The key wrapper uses AES-256-GCM with a fresh 12-byte IV and 16-byte authentication tag. Its associated data binds the library identifier and complete validated video manifest, preventing a wrapped key from being substituted into another video record.
+Each video key is wrapped with AES-256-GCM using a fresh 12-byte IV and 16-byte authentication tag. Associated data binds the library identifier and complete validated manifest, preventing substitution into a different video record.
 
 ## Upload
 
-1. The unlocked browser passes the selected file, library descriptor, and in-memory master key to a dedicated web worker.
-2. The worker verifies the library key, generates a random video identifier and independent 256-bit video key, and encrypts filename and media type.
-3. It encrypts the video key under the library key and sends the manifest, wrapped key, and library identifier to create an authenticated upload draft. Plaintext keys are excluded from the server request schema.
-4. The worker reads, encrypts, and uploads one 1 MiB chunk at a time. Each packet contains a random 12-byte IV, ciphertext, and a 16-byte authentication tag.
-5. The server publishes the completed record after every chunk is present with its expected length. The browser reads the committed record back and refreshes the catalog.
+A library has an immutable encrypted descriptor. Uploads operate only with `DEMO_MODE=false`. Before adding a video, the browser worker must be able to decrypt that descriptor with the entered key. This local upload guard prevents accidentally adding files under a wrong key; it is not server-side write authorization.
 
-AES-GCM authentication binds metadata to the video identifier, size, chunk size, and chunk count. Chunk authentication additionally binds the chunk index and encrypted metadata. Reordered, substituted, or altered packets fail browser authentication.
+The dedicated upload worker generates an independent random 256-bit video key and identifier. It encrypts filename and media type, wraps the video key under the library key, and creates a server draft containing only encrypted metadata, the wrapped key, and the library identifier.
 
-The worker is terminated after completion, failure, cancellation, or locking. An unpublished upload cannot be read through the normal video API.
+The worker reads, encrypts, and uploads one 1 MiB chunk at a time. Each AES-GCM packet contains a random 12-byte IV, ciphertext, and a 16-byte tag. Metadata authentication binds the format, video identifier, size, chunk size, and count. Chunk authentication additionally binds the index and encrypted metadata.
+
+The server publishes a completed record only after all chunks have their expected lengths. The browser reads it back and refreshes the catalog. Completion, failure, cancellation, or locking terminates the upload worker. Unpublished drafts are excluded from normal catalog reads.
 
 ## Playback
 
-Opening `/watch/:id` requires authentication and an unlocked browser library. The browser fetches the encrypted video record, unwraps its video key, and decrypts its metadata locally.
+The browser opens `/watch/:id`, fetches its encrypted record through the session, unwraps the video key, and decrypts metadata locally. A wrong key cannot complete this step.
 
-A service worker creates an in-memory playback session bound to the initiating browser client. The native video element requests its virtual media URL using ordinary byte ranges. The worker fetches encrypted chunks through the authenticated API, verifies and decrypts them, then streams the requested plaintext bytes to the browser's media decoder.
+A service worker creates an in-memory playback session bound to the initiating browser client. The native video element requests a virtual media URL using ordinary byte ranges. The worker fetches encrypted chunks, authenticates and decrypts them, then streams only the requested plaintext bytes to the media decoder.
 
-Closing or locking playback removes its worker session and aborts in-flight chunk requests. A service worker restart loses active playback state; reopening the video restores it. This in-memory state lives in the browser and does not require server affinity.
+Closing or locking playback removes the worker session and aborts in-flight requests. If the browser terminates an idle service worker, a later media request can restore its session from the exact still-open owner window through a private MessageChannel. Restoration is bounded, coalesces concurrent requests, and refuses canceled or locked sessions. Active keys remain in browser memory, without keepalive traffic or persisted recovery state. Closing or reloading ends that active session; the public demo key can be supplied again through its prefill. This browser-local state does not require application-server affinity.
 
-Playback preserves the original file. MP4 and WebM MIME types are accepted up to 2 GiB; codec support depends on the browser. There is no transcoding or server-generated preview.
+Playback preserves the original MP4 or WebM file, up to 2 GiB. Codec support depends on the browser. There is no server-side transcoding, FFmpeg processing, server media job queue, or generated preview. Synteq Apps hosts the Next.js service; no Serverless Functions are implemented.
 
-## Persistent files and deletion
+The acceptance fixture is a prepared 90-second WebM containing 24,755,386 bytes across 24 chunks, with valid duration and cues for range checks. Fixture preparation does not represent a server-side transcoding path or support for additional media types.
 
-`STORAGE_PATH/library.json` holds the immutable library descriptor. Under `STORAGE_PATH/videos`, each video directory contains `draft.json`, a committed `manifest.json` when complete, and numbered ciphertext files in `chunks/`.
+## Decryption activity
 
-Draft and committed records contain only the encrypted manifest, wrapped video key, library identifier, and creation date. A temporary file is written and synced before a hard link atomically publishes it. Existing content cannot be replaced; uploading the same chunk again succeeds only if the packet matches exactly.
+After successful AES-GCM authentication and length validation, the service worker sends a verification event to the exact session owner. The browser validates event origin, worker identity, session ID, chunk index, and expected byte count before recording it in memory.
 
-Every server process must use the same durable filesystem with the required hard-link, atomic rename, and sync semantics. Independent hosts with separate disks are unsupported. Keep one application service on one persistent server unless shared filesystem behavior has been verified.
+The HUD reports unique verified chunks and MiB plus the last verified block. Repeated verification of a chunk advances its pulse revision without increasing unique byte or chunk coverage. Notifications are bounded to one every 200 ms; the UI keeps these updates nonurgent so they do not replace the native video element or cancel route transitions.
 
-Video deletion requires an authenticated, same-origin request and explicit confirmation in the UI. The server atomically moves the committed video's directory to `STORAGE_PATH/.trash` before removing its files. Other clients see the deletion when they refresh their catalog or request the video again. A crash after the move can leave encrypted files outside the catalog until operator cleanup. Retained backups require their own retention policy. Deletion never removes the library descriptor.
+The display reserves 56 px at all states and uses at most 32 cells. It has no continuous idle spinner or simulated fetching/decrypting phases. Pulses correspond to verification events and are disabled under reduced-motion preferences. Activity contains no key, plaintext buffer, filename, or source URL and is cleared when playback closes or locks.
 
-Canceled uploads can leave unpublished files. An operator can remove expired drafts with the [offline maintenance procedure](deployment.md#clean-up-interrupted-uploads). There is no automatic retention cleanup or resumable upload workflow.
+## Hosted object storage
+
+`STORAGE_DRIVER=s3` selects one configured bucket and required `S3_PREFIX` namespace. Every replica uses it for the library descriptor, committed catalog, encrypted chunks, drafts, and deletion markers. Temporary app-local disk is not canonical state.
+
+Immutable object publication uses [R2 conditional creation](https://developers.cloudflare.com/r2/api/s3/extensions/#conditional-operations-in-putobject) with `If-None-Match: *`. Reads are bounded, and listing follows all object-list pages. Storage errors fail the request without switching backends or creating an empty replacement catalog.
+
+Video deletion publishes an immutable marker under `tombstones/videos/<video-id>.json` before removing objects. Listing, reads, and finalization honor it, so concurrent completion cannot make the deleted video visible again. Retain these markers permanently during backup and maintenance. Interrupted cleanup or a racing upload can leave encrypted objects; repeating deletion can finish their removal without restoring the catalog entry.
+
+## Local filesystem storage
+
+`STORAGE_DRIVER=filesystem` requires a durable `STORAGE_PATH`. It contains `library.json`, `videos/<video-id>/` directories with drafts, committed manifests, and numbered encrypted chunks, and deletion markers under `tombstones/videos/`.
+
+A temporary file is written and synced before a hard link publishes it atomically. Existing content cannot be replaced; retrying a chunk succeeds only when its bytes match. All processes must use the same filesystem with the required hard-link, rename, and sync semantics. Independent local disks are unsupported.
+
+Filesystem deletion moves a committed video outside the catalog before removing its files. Interrupted deletion can leave encrypted files in `.trash`. The [draft maintenance script](deployment.md#local-filesystem-maintenance) handles expired unfinished uploads only.
 
 ## HTTP surface
 
 | Endpoint | Purpose | Access |
 | --- | --- | --- |
-| `GET /api/health` | Validate configuration and write/sync a temporary storage file | Public |
-| `GET /api/session` | Check library session | Session cookie |
-| `POST /api/session` | Sign in | Library password and matching origin |
+| `GET /api/health` | Validate configuration and exercise selected storage | Public |
+| `GET /api/session` | Check convenience-session presence | Session cookie |
+| `POST /api/session` | Open a session with `{}` | Matching origin |
 | `DELETE /api/session` | Clear session cookie | Matching origin |
-| `GET /api/library` | Read the descriptor or initialization state | Library session |
-| `POST /api/library` | Create the immutable descriptor | Library session and matching origin |
-| `GET /api/videos` | List committed encrypted video records | Library session |
-| `POST /api/videos` | Create an encrypted upload draft | Library session and matching origin |
-| `PUT /api/videos/:id/chunks/:index` | Publish an encrypted chunk | Library session and matching origin |
-| `POST /api/videos/:id/complete` | Publish a completed video | Library session and matching origin |
-| `GET /api/videos/:id` | Retrieve a committed encrypted record | Library session |
-| `GET /api/videos/:id/chunks/:index` | Retrieve an encrypted chunk | Library session |
-| `DELETE /api/videos/:id` | Permanently remove a committed video | Library session and matching origin |
+| `GET /api/library` | Read the encrypted descriptor or initialization state | Session |
+| `POST /api/library` | Create the immutable encrypted descriptor | Writable mode, session, matching origin |
+| `GET /api/videos` | List committed encrypted records | Session |
+| `POST /api/videos` | Create an encrypted draft | Writable mode, session, matching origin |
+| `PUT /api/videos/:id/chunks/:index` | Publish an encrypted chunk | Writable mode, session, matching origin |
+| `POST /api/videos/:id/complete` | Publish a completed video | Writable mode, session, matching origin |
+| `GET /api/videos/:id` | Retrieve a committed encrypted record | Session |
+| `GET /api/videos/:id/chunks/:index` | Retrieve an encrypted chunk | Session |
+| `DELETE /api/videos/:id` | Remove a committed video | Writable mode, session, matching origin |
 
-JSON request schemas reject extra fields. Requests and file reads are bounded. Unauthenticated video requests return 401; absent videos return 404. Readiness checks storage access, without decrypting or validating every saved video.
+Public demo mode returns `403` for all five library mutation routes while allowing sessions, reads, search, and playback. Schemas and body limits constrain writable requests. Session presence still does not establish ownership. See the [security limits](security.md) before exposing writable mode.
+
+## Why this boundary
+
+Provider-managed server-side encryption remains useful as an at-rest layer. It is not the application confidentiality boundary because the provider controls the managed keys for the objects it stores. R2 also automatically encrypts objects at rest with AES-256 and Cloudflare-managed keys; EEEVP uploads browser ciphertext first, so that provider layer protects ciphertext rather than plaintext media. A passive filesystem or object-store snapshot can still reveal identifiers, sizes, timestamps, and access patterns; without the private browser key it cannot directly recover names or media. The public demo is the deliberate exception because its synthetic key is published to viewers.
+
+TLS protects the network hop. A passive observer who obtains TLS session material but not the private browser key still sees AES-GCM ciphertext in the application payload. Active endpoint compromise is different: malicious JavaScript, a compromised browser, or an unlocked device can capture keys or plaintext. EEEVP does not claim protection against that class of attack.
+
+The current API's convenience session is a transport and workflow guard, not proof of key possession. Private writable mode therefore needs deployment-level access controls when mutation integrity or availability matters. Public demo mode returns `403` before all five library mutation routes and is the safe presentation mode for a known demo key.

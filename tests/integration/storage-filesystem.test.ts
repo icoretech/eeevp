@@ -1,5 +1,6 @@
 // Real disk and Web Crypto tests protect the private library boundary without mocking the filesystem.
 import {
+  mkdir,
   mkdtemp,
   readdir,
   readFile,
@@ -23,11 +24,12 @@ import {
   encryptChunk,
 } from "@/lib/crypto/video-crypto";
 import type { ServerConfig } from "@/lib/server/config";
+import { FilesystemObjectStore } from "@/lib/server/filesystem-object-store";
 import { VideoStorage } from "@/lib/server/storage";
 import { CHUNK_SIZE, type LibraryDescriptor } from "@/lib/video/schema";
 
 let directory: string;
-let config: ServerConfig;
+let config: Extract<ServerConfig, { STORAGE_DRIVER: "filesystem" }>;
 let libraryKey: string;
 let library: LibraryDescriptor;
 
@@ -35,7 +37,8 @@ beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "eeevp-storage-"));
   config = {
     APP_ORIGIN: "https://example.com",
-    LIBRARY_PASSWORD: "sample-library-password",
+    STORAGE_DRIVER: "filesystem",
+    DEMO_MODE: false,
     SESSION_SECRET: "sample-session-secret-for-tests-only-123456789",
     STORAGE_PATH: directory,
   };
@@ -245,11 +248,38 @@ describe("persistent private video library", () => {
     );
     await expect(
       storage.deleteVideo(committed.manifest.id),
-    ).rejects.toMatchObject({ status: 404 });
+    ).resolves.toBeUndefined();
     await expect(
       stat(join(directory, "videos", committed.manifest.id)),
     ).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readdir(join(directory, ".trash"))).toEqual([]);
+  });
+
+  it("keeps deleted identifiers invisible when a delayed writer recreates a manifest", async () => {
+    const storage = new VideoStorage(config);
+    const video = await fixture(40);
+    const id = video.manifest.id;
+    await storage.createDraft(video.manifest, video.wrappedKey, library.id);
+    await storage.putChunk(id, 0, new Uint8Array(68));
+    await storage.complete(id);
+    const record = await storage.readable(id);
+    await storage.deleteVideo(id);
+    const path = join(directory, "videos", id);
+    await mkdir(path, { recursive: true });
+    await writeFile(join(path, "manifest.json"), JSON.stringify(record));
+    const replica = new VideoStorage(config);
+    expect(await replica.list()).toEqual([]);
+    await expect(replica.readable(id)).rejects.toMatchObject({ status: 404 });
+    await expect(
+      replica.createDraft(video.manifest, video.wrappedKey, library.id),
+    ).rejects.toMatchObject({ status: 404 });
+    await replica.deleteVideo(id);
+    await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      (
+        await stat(join(directory, "tombstones", "videos", `${id}.json`))
+      ).isFile(),
+    ).toBe(true);
   });
 
   it("rejects truncated chunk files and malformed persisted records", async () => {
@@ -266,6 +296,36 @@ describe("persistent private video library", () => {
     await expect(storage.draft(video.manifest.id)).rejects.toMatchObject({
       status: 503,
     });
+  });
+
+  it("refuses symlinked ancestor directories without reading, writing or deleting their targets", async () => {
+    const store = new FilesystemObjectStore(directory);
+    const outside = await mkdtemp(join(tmpdir(), "eeevp-outside-"));
+    try {
+      await writeFile(join(outside, "marker"), "preserve");
+      const videos = join(directory, "videos");
+      await symlink(outside, videos);
+      await expect(store.read("videos/marker", 32)).rejects.toThrow(
+        "directory",
+      );
+      await expect(store.head("videos/marker")).rejects.toThrow("directory");
+      await expect(
+        store.publish("videos/changed", "overwrite"),
+      ).rejects.toThrow("directory");
+      await expect(store.remove("videos/marker")).rejects.toThrow("directory");
+      await expect(store.removeVideo(library.id)).rejects.toThrow("directory");
+      expect(await readFile(join(outside, "marker"), "utf8")).toBe("preserve");
+      await rm(videos);
+      const videoPath = join(videos, library.id);
+      await mkdir(videoPath, { recursive: true });
+      await symlink(outside, join(videoPath, "chunks"));
+      await expect(
+        store.publish(`videos/${library.id}/chunks/0`, "ciphertext"),
+      ).rejects.toThrow("directory");
+      expect(await readdir(outside)).toEqual(["marker"]);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   it("rejects traversal identifiers and follows no object-file symlinks", async () => {

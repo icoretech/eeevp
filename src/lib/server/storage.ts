@@ -1,19 +1,5 @@
-// Atomic files on one persistent volume keep upload state durable and safe across Node processes.
+// Every library record is immutable shared storage; deletion tombstones prevent cross-replica resurrection.
 import "server-only";
-import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import {
-  type FileHandle,
-  link,
-  lstat,
-  mkdir,
-  open,
-  readdir,
-  rename,
-  rm,
-  unlink,
-} from "node:fs/promises";
-import { dirname, join } from "node:path";
 import {
   CHUNK_SIZE,
   type LibraryDescriptor,
@@ -24,20 +10,14 @@ import {
   videoIdSchema,
 } from "@/lib/video/schema";
 import type { ServerConfig } from "./config";
+import { FilesystemObjectStore } from "./filesystem-object-store";
 import { HttpError } from "./http";
-
-function hasFileCode(error: unknown, code: string) {
-  return error instanceof Error && "code" in error && error.code === code;
-}
+import type { ObjectStore } from "./object-store";
+import { createObjectStore } from "./storage-factory";
 
 export function expectedChunkLength(manifest: VideoManifest, index: number) {
-  if (
-    !Number.isSafeInteger(index) ||
-    index < 0 ||
-    index >= manifest.chunkCount
-  ) {
+  if (!Number.isSafeInteger(index) || index < 0 || index >= manifest.chunkCount)
     throw new HttpError(404, "Video chunk not found");
-  }
   return Math.min(CHUNK_SIZE, manifest.size - index * CHUNK_SIZE) + 28;
 }
 
@@ -51,99 +31,39 @@ export function parseChunkIndex(value: string) {
 }
 
 export class VideoStorage {
-  private readonly root: string;
+  private readonly store: ObjectStore;
 
   constructor(config: ServerConfig) {
-    this.root = config.STORAGE_PATH;
+    this.store = createObjectStore(config);
   }
 
-  private filePath(id: string, suffix: string) {
+  private key(id: string, suffix: string) {
     const parsed = videoIdSchema.safeParse(id);
     if (!parsed.success) throw new HttpError(404, "Video not found");
-    return join(this.root, "videos", parsed.data, suffix);
+    return `videos/${parsed.data}/${suffix}`;
   }
 
-  async ready() {
-    await mkdir(this.root, { recursive: true, mode: 0o700 });
-    const path = join(this.root, `.health-${randomUUID()}`);
-    const handle = await open(path, "wx", 0o600);
-    try {
-      await handle.writeFile("ready");
-      await handle.sync();
-    } finally {
-      await handle.close();
-      await unlink(path);
-    }
+  private tombstoneKey(id: string) {
+    const parsed = videoIdSchema.safeParse(id);
+    if (!parsed.success) throw new HttpError(404, "Video not found");
+    return `tombstones/videos/${parsed.data}.json`;
   }
 
-  private async readFile(path: string, limit: number) {
-    let handle: FileHandle;
-    try {
-      handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    } catch (error) {
-      if (hasFileCode(error, "ENOENT")) return null;
-      throw error;
-    }
-    try {
-      const stat = await handle.stat();
-      if (!stat.isFile() || stat.size > limit)
-        throw new HttpError(503, "Stored video is unavailable");
-      // Bound allocation and reads even if an operator modifies a published file outside the app.
-      const bytes = Buffer.alloc(Math.min(stat.size, limit) + 1);
-      let length = 0;
-      while (length < bytes.byteLength) {
-        const result = await handle.read(
-          bytes,
-          length,
-          bytes.byteLength - length,
-          length,
-        );
-        if (result.bytesRead === 0) break;
-        length += result.bytesRead;
-      }
-      if (length > limit || length !== stat.size)
-        throw new HttpError(503, "Stored video is unavailable");
-      return bytes.subarray(0, length);
-    } finally {
-      await handle.close();
-    }
+  private async deleted(id: string) {
+    return (await this.store.head(this.tombstoneKey(id))) !== null;
   }
 
-  private async publish(
-    path: string,
-    body: string | Uint8Array,
-    createParents = true,
-  ) {
-    if (createParents)
-      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-    const temporary = join(dirname(path), `.pending-${randomUUID()}`);
-    const handle = await open(temporary, "wx", 0o600);
-    try {
-      try {
-        await handle.writeFile(body);
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      // A hard link publishes a fully written inode atomically and never replaces an existing object.
-      await link(temporary, path);
-      const directory = await open(dirname(path), constants.O_RDONLY);
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
-      return true;
-    } catch (error) {
-      if (hasFileCode(error, "EEXIST")) return false;
-      throw error;
-    } finally {
-      await unlink(temporary);
-    }
+  private async requirePresent(id: string) {
+    if (await this.deleted(id)) throw new HttpError(404, "Video not found");
+  }
+
+  ready() {
+    return this.store.ready();
   }
 
   private async getRecord(id: string, kind: "draft" | "manifest") {
-    const body = await this.readFile(this.filePath(id, `${kind}.json`), 65536);
+    if (await this.deleted(id)) return null;
+    const body = await this.store.read(this.key(id, `${kind}.json`), 65536);
     if (!body) return null;
     try {
       const record = libraryVideoSchema.parse(
@@ -151,14 +71,16 @@ export class VideoStorage {
       );
       if (record.manifest.id !== id)
         throw new Error("Mismatched video identifier");
+      if (await this.deleted(id)) return null;
       return record;
-    } catch {
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
       throw new HttpError(503, "Stored video is unavailable");
     }
   }
 
   async library() {
-    const bytes = await this.readFile(join(this.root, "library.json"), 4096);
+    const bytes = await this.store.read("library.json", 4096);
     if (!bytes) return null;
     try {
       return libraryDescriptorSchema.parse(
@@ -171,14 +93,8 @@ export class VideoStorage {
 
   async createLibrary(descriptor: LibraryDescriptor) {
     const library = libraryDescriptorSchema.parse(descriptor);
-    if (
-      !(await this.publish(
-        join(this.root, "library.json"),
-        JSON.stringify(library),
-      ))
-    ) {
+    if (!(await this.store.publish("library.json", JSON.stringify(library))))
       throw new HttpError(409, "Library has already been initialized");
-    }
     return library;
   }
 
@@ -194,24 +110,17 @@ export class VideoStorage {
       createdAt: new Date().toISOString(),
     });
     const library = await this.library();
-    if (!library || library.id !== record.libraryId) {
-      throw new HttpError(
-        409,
-        "Unlock the initialized library before uploading",
-      );
-    }
-    await mkdir(dirname(this.filePath(record.manifest.id, "chunks/0")), {
-      recursive: true,
-      mode: 0o700,
-    });
+    if (!library || library.id !== record.libraryId)
+      throw new HttpError(409, "Open the initialized library before uploading");
+    await this.requirePresent(record.manifest.id);
     if (
-      !(await this.publish(
-        this.filePath(record.manifest.id, "draft.json"),
+      !(await this.store.publish(
+        this.key(record.manifest.id, "draft.json"),
         JSON.stringify(record),
       ))
-    ) {
+    )
       throw new HttpError(409, "Video identifier already exists");
-    }
+    await this.requirePresent(record.manifest.id);
   }
 
   async draft(id: string) {
@@ -221,23 +130,18 @@ export class VideoStorage {
   }
 
   async list() {
-    const directory = join(this.root, "videos");
-    const entries = await readdir(directory, { withFileTypes: true }).catch(
-      (error: unknown) => {
-        if (hasFileCode(error, "ENOENT")) return [];
-        throw error;
-      },
-    );
-    const ids = entries
-      .filter(
-        (entry) =>
-          entry.isDirectory() && videoIdSchema.safeParse(entry.name).success,
-      )
-      .map((entry) => entry.name);
+    const keys = await this.store.list("videos/");
+    const ids = new Set<string>();
+    for (const key of keys) {
+      const match = /^videos\/([^/]+)\/manifest\.json$/.exec(key);
+      if (match?.[1] && videoIdSchema.safeParse(match[1]).success)
+        ids.add(match[1]);
+    }
+    const ordered = [...ids];
     const records: LibraryVideo[] = [];
-    for (let offset = 0; offset < ids.length; offset += 8) {
+    for (let offset = 0; offset < ordered.length; offset += 8) {
       const batch = await Promise.all(
-        ids
+        ordered
           .slice(offset, offset + 8)
           .map((id) => this.getRecord(id, "manifest")),
       );
@@ -252,67 +156,52 @@ export class VideoStorage {
 
   async putChunk(id: string, index: number, packet: Uint8Array) {
     const record = await this.draft(id);
-    if (packet.byteLength !== expectedChunkLength(record.manifest, index)) {
+    if (packet.byteLength !== expectedChunkLength(record.manifest, index))
       throw new HttpError(400, "Encrypted chunk has an invalid length");
-    }
-    const path = this.filePath(id, `chunks/${index}`);
-    if (!(await this.publish(path, packet, false))) {
-      const existing = await this.readFile(path, packet.byteLength);
-      if (!existing?.equals(packet)) {
+    const key = this.key(id, `chunks/${index}`);
+    if (!(await this.store.publish(key, packet))) {
+      const existing = await this.store.read(key, packet.byteLength);
+      if (!existing?.equals(packet))
         throw new HttpError(
           409,
           "Encrypted chunk already exists with different content",
         );
-      }
     }
+    await this.requirePresent(id);
   }
 
   async complete(id: string) {
     const record = await this.draft(id);
-    // Bound open file concurrency independently of video size.
     for (let offset = 0; offset < record.manifest.chunkCount; offset += 8) {
       const count = Math.min(8, record.manifest.chunkCount - offset);
       await Promise.all(
         Array.from({ length: count }, async (_, position) => {
           const index = offset + position;
-          let handle: FileHandle | undefined;
-          try {
-            handle = await open(
-              this.filePath(id, `chunks/${index}`),
-              constants.O_RDONLY | constants.O_NOFOLLOW,
-            );
-            const stat = await handle.stat();
-            if (
-              !stat.isFile() ||
-              stat.size !== expectedChunkLength(record.manifest, index)
-            ) {
-              throw new HttpError(409, "Upload is incomplete");
-            }
-          } catch (error) {
-            if (hasFileCode(error, "ENOENT"))
-              throw new HttpError(409, "Upload is incomplete");
-            throw error;
-          } finally {
-            await handle?.close();
-          }
+          const object = await this.store.head(this.key(id, `chunks/${index}`));
+          if (
+            !object ||
+            object.size !== expectedChunkLength(record.manifest, index)
+          )
+            throw new HttpError(409, "Upload is incomplete");
         }),
       );
     }
+    await this.requirePresent(id);
     if (
-      !(await this.publish(
-        this.filePath(id, "manifest.json"),
+      !(await this.store.publish(
+        this.key(id, "manifest.json"),
         JSON.stringify(record),
-        false,
       ))
     ) {
+      await this.requirePresent(id);
       const committed = await this.getRecord(id, "manifest");
-      if (!committed || JSON.stringify(committed) !== JSON.stringify(record)) {
+      if (!committed || JSON.stringify(committed) !== JSON.stringify(record))
         throw new HttpError(
           409,
           "Video has already been committed with different content",
         );
-      }
     }
+    await this.requirePresent(id);
   }
 
   async readable(id: string) {
@@ -324,46 +213,32 @@ export class VideoStorage {
   async readChunk(id: string, index: number) {
     const video = await this.readable(id);
     const length = expectedChunkLength(video.manifest, index);
-    const body = await this.readFile(
-      this.filePath(id, `chunks/${index}`),
-      length,
-    );
+    const body = await this.store.read(this.key(id, `chunks/${index}`), length);
     if (!body) throw new HttpError(404, "Video chunk not found");
     if (body.byteLength !== length)
       throw new HttpError(503, "Stored video is unavailable");
+    await this.requirePresent(id);
     return body;
   }
 
   async deleteVideo(id: string) {
-    await this.readable(id);
-    const path = this.filePath(id, "");
-    const entry = await lstat(path).catch((error: unknown) => {
-      if (hasFileCode(error, "ENOENT"))
-        throw new HttpError(404, "Video not found");
-      throw error;
-    });
-    if (!entry.isDirectory() || entry.isSymbolicLink())
-      throw new HttpError(404, "Video not found");
-    const trash = join(this.root, ".trash");
-    await mkdir(trash, { recursive: true, mode: 0o700 });
-    const trashEntry = await lstat(trash);
-    if (!trashEntry.isDirectory() || trashEntry.isSymbolicLink())
-      throw new HttpError(503, "Video storage is unavailable");
-    const removed = join(trash, randomUUID());
-    try {
-      await rename(path, removed);
-    } catch (error) {
-      if (hasFileCode(error, "ENOENT"))
-        throw new HttpError(404, "Video not found");
-      throw error;
+    const tombstone = this.tombstoneKey(id);
+    if (!(await this.deleted(id))) {
+      await this.readable(id);
+      await this.store.publish(
+        tombstone,
+        JSON.stringify({ version: 1, id, createdAt: new Date().toISOString() }),
+      );
     }
-    const directory = await open(join(this.root, "videos"), constants.O_RDONLY);
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
+    if (this.store instanceof FilesystemObjectStore) {
+      await this.store.removeVideo(id);
+      return;
     }
-    await rm(removed, { recursive: true });
+    const keys = await this.store.list(this.key(id, ""));
+    for (let offset = 0; offset < keys.length; offset += 8)
+      await Promise.all(
+        keys.slice(offset, offset + 8).map((key) => this.store.remove(key)),
+      );
   }
 }
 

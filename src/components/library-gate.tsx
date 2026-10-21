@@ -1,24 +1,26 @@
 "use client";
 
-// Authentication and browser-only key entry are separate steps before private video access.
-import { DownloadIcon, KeyRoundIcon, LockKeyholeIcon } from "lucide-react";
-import { type ReactNode, useActionState, useRef, useState } from "react";
+// Key entry opens the workspace without checking the key; recovery text is read locally into the same field.
+import {
+  ChevronDownIcon,
+  ChevronUpIcon,
+  DownloadIcon,
+  KeyRoundIcon,
+} from "lucide-react";
+import {
+  type ChangeEvent,
+  type ReactNode,
+  useActionState,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { useFormStatus } from "react-dom";
 import { useLibrary } from "@/components/library-provider";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
+import { Card, CardContent, CardFooter } from "@/components/ui/card";
 import {
   Field,
-  FieldContent,
   FieldDescription,
   FieldError,
   FieldGroup,
@@ -26,350 +28,252 @@ import {
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import {
+  normalizeLibraryKeyInput,
+  serializeLibraryKeyRecovery,
+} from "@/lib/crypto/key-input";
 import { createLibraryKey } from "@/lib/crypto/library-crypto";
 
-function SubmitButton({ children }: { children: ReactNode }) {
+function SubmitButton({ importing }: { importing: boolean }) {
   const { pending } = useFormStatus();
   return (
-    <Button type="submit" disabled={pending} className="w-full" size="lg">
-      {pending ? <Spinner data-icon="inline-start" /> : null}
-      {children}
+    <Button
+      type="submit"
+      disabled={pending || importing}
+      className="w-full"
+      size="lg"
+    >
+      {pending ? (
+        <Spinner data-icon="inline-start" />
+      ) : (
+        <KeyRoundIcon data-icon="inline-start" />
+      )}
+      Decrypt &amp; Login
     </Button>
   );
 }
 
-function GateError({ message }: { message: string | null }) {
-  return message ? <FieldError>{message}</FieldError> : null;
-}
-
 function LoginForm() {
-  const { authenticate, error } = useLibrary();
-  const passwordInput = useRef<HTMLInputElement>(null);
-  const [formError, action, pending] = useActionState(
-    async (_previous: string | null) => {
-      const password = passwordInput.current?.value;
-      if (!password) return "Enter your library password.";
-      try {
-        await authenticate(password);
-        return null;
-      } catch {
-        return "Could not sign in. Check your password and retry.";
-      } finally {
-        if (passwordInput.current) passwordInput.current.value = "";
-      }
-    },
-    null,
-  );
-
-  return (
-    <Card className="gate-card w-full">
-      <CardHeader>
-        <CardTitle>Sign in to EEEVP</CardTitle>
-        <CardDescription>
-          Enter the library password to access your private video collection.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <form action={action}>
-          <FieldGroup>
-            <Field data-invalid={Boolean(error || formError)}>
-              <FieldLabel htmlFor="library-password">
-                Library password
-              </FieldLabel>
-              <Input
-                ref={passwordInput}
-                id="library-password"
-                type="password"
-                autoComplete="current-password"
-                required
-                maxLength={1024}
-                disabled={pending}
-                aria-invalid={Boolean(error || formError)}
-                aria-describedby="library-password-description"
-              />
-              <FieldDescription id="library-password-description">
-                Your encryption key is entered separately in your browser.
-              </FieldDescription>
-            </Field>
-            <GateError message={error || formError} />
-            <Field>
-              <SubmitButton>Sign in</SubmitButton>
-            </Field>
-          </FieldGroup>
-        </form>
-      </CardContent>
-      <CardFooter>
-        <p className="text-sm text-muted-foreground">
-          The password grants access. Your library key decrypts your videos.
-        </p>
-      </CardFooter>
-    </Card>
-  );
-}
-
-function UnlockForm() {
-  const { unlock, lock, error } = useLibrary();
+  const { enter, lock, status, error, demoMode, demoPublicKey } = useLibrary();
   const keyInput = useRef<HTMLInputElement>(null);
+  const importRevision = useRef(0);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [formError, action, pending] = useActionState(
     async (_previous: string | null) => {
-      const key = keyInput.current?.value.trim();
-      if (!key) return "Enter your saved library key.";
+      importRevision.current += 1;
+      setImporting(false);
+      setImportError(null);
+      const input = keyInput.current?.value;
+      if (!input?.trim()) return "Enter your encryption key.";
       try {
-        await unlock(key);
+        await enter(input);
         return null;
-      } catch {
-        return "Could not unlock your library. Check your saved library key.";
+      } catch (failure) {
+        return failure instanceof Error
+          ? failure.message
+          : "The library could not be opened.";
       } finally {
         if (keyInput.current) keyInput.current.value = "";
       }
     },
     null,
   );
+  const message = importError || error || formError;
+
+  useEffect(
+    () => () => {
+      importRevision.current += 1;
+    },
+    [],
+  );
+
+  async function importRecoveryFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.item(0);
+    event.currentTarget.value = "";
+    if (!file) return;
+    const request = ++importRevision.current;
+    setImportError(null);
+    setImporting(true);
+    try {
+      if (file.size > 8192) throw new Error("Recovery file is too large");
+      const key = normalizeLibraryKeyInput(await file.text());
+      if (!key) throw new Error("Recovery file is empty");
+      if (request !== importRevision.current) return;
+      if (keyInput.current) {
+        keyInput.current.value = key;
+        keyInput.current.focus();
+      }
+    } catch {
+      if (request !== importRevision.current) return;
+      setImportError("Choose a valid EEEVP recovery .txt file, up to 8 KiB.");
+    } finally {
+      if (request === importRevision.current) setImporting(false);
+    }
+  }
+
+  function generateRecoveryKey() {
+    const input = keyInput.current;
+    if (!input) return;
+    importRevision.current += 1;
+    setImporting(false);
+    setImportError(null);
+    try {
+      const key = createLibraryKey();
+      const file = new Blob([serializeLibraryKeyRecovery(key)], {
+        type: "text/plain;charset=utf-8",
+      });
+      const url = URL.createObjectURL(file);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+      const download = document.createElement("a");
+      download.href = url;
+      download.download = "eeevp-library-key.txt";
+      download.click();
+      input.value = key;
+      input.focus();
+    } catch {
+      setImportError(
+        "A recovery key could not be generated. Please try again.",
+      );
+    }
+  }
 
   return (
     <Card className="gate-card w-full">
-      <CardHeader>
-        <CardTitle>Unlock your library</CardTitle>
-        <CardDescription>
-          Enter the library key saved when this library was created. Videos are
-          decrypted only in your browser.
-        </CardDescription>
-      </CardHeader>
       <CardContent>
         <form action={action} autoComplete="off">
           <FieldGroup>
-            <Field data-invalid={Boolean(error || formError)}>
-              <FieldLabel htmlFor="library-key">Library key</FieldLabel>
+            <Field data-invalid={Boolean(message)}>
+              <FieldLabel htmlFor="encryption-key">Encryption key</FieldLabel>
               <Input
                 ref={keyInput}
-                id="library-key"
+                defaultValue={demoMode ? demoPublicKey : undefined}
+                id="encryption-key"
                 type="password"
                 autoComplete="off"
                 autoCapitalize="none"
                 spellCheck={false}
                 required
+                maxLength={4096}
                 disabled={pending}
-                aria-invalid={Boolean(error || formError)}
-                aria-describedby="library-key-description"
+                aria-invalid={Boolean(message)}
+                aria-describedby="encryption-key-description"
+                onInput={() => {
+                  importRevision.current += 1;
+                  setImporting(false);
+                  setImportError(null);
+                }}
               />
-              <FieldDescription id="library-key-description">
-                The key stays in memory for this session. Enter it again after
-                reloading or locking your library.
+              <FieldDescription id="encryption-key-description">
+                {demoMode
+                  ? "Public demo key. Browsing and playback only."
+                  : "Your key stays in this browser session. Reloading or locking clears it."}
               </FieldDescription>
             </Field>
-            <GateError message={error || formError} />
+            {message ? <FieldError>{message}</FieldError> : null}
             <Field>
-              <SubmitButton>Unlock library</SubmitButton>
+              <SubmitButton importing={importing} />
             </Field>
+            {!demoMode ? (
+              <FieldGroup>
+                <Field>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    aria-expanded={advancedOpen}
+                    aria-controls="advanced-key-tools"
+                    disabled={pending}
+                    onClick={() => {
+                      importRevision.current += 1;
+                      setImporting(false);
+                      setImportError(null);
+                      setAdvancedOpen((open) => !open);
+                    }}
+                  >
+                    Advanced key tools
+                    {advancedOpen ? (
+                      <ChevronUpIcon data-icon="inline-end" />
+                    ) : (
+                      <ChevronDownIcon data-icon="inline-end" />
+                    )}
+                  </Button>
+                </Field>
+                <FieldGroup id="advanced-key-tools" hidden={!advancedOpen}>
+                  <Field>
+                    <FieldLabel htmlFor="recovery-file">
+                      Import .txt recovery file
+                    </FieldLabel>
+                    <Input
+                      id="recovery-file"
+                      type="file"
+                      accept=".txt,text/plain"
+                      disabled={pending || importing}
+                      onChange={(event) => void importRecoveryFile(event)}
+                      aria-describedby="recovery-file-description"
+                    />
+                    <FieldDescription id="recovery-file-description">
+                      {importing
+                        ? "Reading your recovery file on this device..."
+                        : "Fills the encryption key field. The file stays on this device."}
+                    </FieldDescription>
+                  </Field>
+                  <Field>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={generateRecoveryKey}
+                      disabled={pending || importing}
+                      aria-describedby="generate-key-description"
+                    >
+                      <DownloadIcon data-icon="inline-start" />
+                      Generate a new library key
+                    </Button>
+                    <FieldDescription id="generate-key-description">
+                      For a new library. Downloads a recovery file; existing
+                      videos still need their original key.
+                    </FieldDescription>
+                  </Field>
+                </FieldGroup>
+              </FieldGroup>
+            ) : null}
           </FieldGroup>
         </form>
       </CardContent>
-      <CardFooter className="justify-between gap-3">
-        <p className="text-sm text-muted-foreground">
-          Signed in. Library locked.
-        </p>
-        <Button
-          variant="ghost"
-          type="button"
-          onClick={() => void lock()}
-          disabled={pending}
-        >
-          Sign out
-        </Button>
-      </CardFooter>
-    </Card>
-  );
-}
-
-function saveRecoveryKey(key: string) {
-  const file = new Blob(
-    [
-      "EEEVP library recovery key\n\n",
-      key,
-      "\n\nKeep this key private and safe. It decrypts your EEEVP library.\n",
-      "Enter it after signing in on another device or after reloading.\n",
-      "Your library password cannot replace this key.\n",
-    ],
-    { type: "text/plain;charset=utf-8" },
-  );
-  const url = URL.createObjectURL(file);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = "eeevp-library-key.txt";
-  link.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-}
-
-function SetupForm() {
-  const { initialize, lock, error } = useLibrary();
-  const [key, setKey] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
-  const [formError, action, pending] = useActionState(
-    async (_previous: string | null) => {
-      if (!key || !saved) return "Save your library key before continuing.";
-      try {
-        await initialize(key);
-        return null;
-      } catch {
-        return "Could not initialize your library. Please retry.";
-      }
-    },
-    null,
-  );
-
-  return (
-    <Card className="gate-card w-full">
-      <CardHeader>
-        <CardTitle>Create your private library</CardTitle>
-        <CardDescription>
-          Create one encryption key for this library. Save it before adding your
-          first video.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        {key ? (
-          <form action={action}>
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="new-library-key">
-                  Your library key
-                </FieldLabel>
-                <Input
-                  id="new-library-key"
-                  value={key}
-                  readOnly
-                  autoComplete="off"
-                  spellCheck={false}
-                  className="font-mono"
-                  aria-describedby="new-library-key-description"
-                />
-                <FieldDescription id="new-library-key-description">
-                  This key never leaves your browser. Keep a private copy to
-                  unlock your videos on this or another device.
-                </FieldDescription>
-              </Field>
-              <Field>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => saveRecoveryKey(key)}
-                  disabled={pending}
-                >
-                  <DownloadIcon data-icon="inline-start" />
-                  Download recovery key
-                </Button>
-              </Field>
-              <Alert>
-                <KeyRoundIcon />
-                <AlertTitle>Keep your key safe</AlertTitle>
-                <AlertDescription>
-                  If you lose this key, your videos cannot be recovered with the
-                  library password.
-                </AlertDescription>
-              </Alert>
-              <Field orientation="horizontal">
-                <Checkbox
-                  id="saved-library-key"
-                  checked={saved}
-                  onCheckedChange={setSaved}
-                  disabled={pending}
-                />
-                <FieldContent>
-                  <FieldLabel htmlFor="saved-library-key">
-                    I saved my library key
-                  </FieldLabel>
-                  <FieldDescription>
-                    I can find my saved copy when I need to unlock this library.
-                  </FieldDescription>
-                </FieldContent>
-              </Field>
-              <GateError message={error || formError} />
-              <Field>
-                <Button
-                  type="submit"
-                  size="lg"
-                  className="w-full"
-                  disabled={!saved || pending}
-                >
-                  {pending ? <Spinner data-icon="inline-start" /> : null}
-                  Initialize library
-                </Button>
-              </Field>
-            </FieldGroup>
-          </form>
-        ) : (
-          <FieldGroup>
-            <Alert>
-              <LockKeyholeIcon />
-              <AlertTitle>A key separate from your password</AlertTitle>
-              <AlertDescription>
-                Your browser encrypts and decrypts videos using this key. The
-                server stores encrypted files.
-              </AlertDescription>
-            </Alert>
-            <GateError message={error} />
-            <Field>
-              <Button
-                type="button"
-                size="lg"
-                onClick={() => setKey(createLibraryKey())}
-              >
-                <KeyRoundIcon data-icon="inline-start" />
-                Create library key
-              </Button>
-            </Field>
-          </FieldGroup>
-        )}
-      </CardContent>
-      <CardFooter className="justify-between gap-3">
-        <p className="text-sm text-muted-foreground">
-          First-time library setup
-        </p>
-        <Button
-          variant="ghost"
-          type="button"
-          onClick={() => void lock()}
-          disabled={pending}
-        >
-          Sign out
-        </Button>
-      </CardFooter>
+      {status === "locked" ? (
+        <CardFooter className="justify-end">
+          <Button
+            variant="ghost"
+            type="button"
+            onClick={() => {
+              importRevision.current += 1;
+              setImporting(false);
+              void lock();
+            }}
+            disabled={pending}
+          >
+            Retry sign out
+          </Button>
+        </CardFooter>
+      ) : null}
     </Card>
   );
 }
 
 export function LibraryGate({ children }: { children: ReactNode }) {
   const { status } = useLibrary();
-  if (status === "unlocked") return children;
+  if (status === "open") return children;
   return (
     <section className="library-gate mx-auto flex w-full max-w-lg flex-col gap-6 py-12 md:py-20">
       <div className="gate-heading flex flex-col gap-3">
-        <p className="eyebrow">PRIVATE VIDEO LIBRARY</p>
         <h1 className="text-4xl font-medium tracking-tight">
-          Your videos. Private.
+          Unlock your library
         </h1>
         <p className="text-sm leading-relaxed text-muted-foreground">
-          A private home for your videos, encrypted before upload and decrypted
-          when you watch.
+          Decryption happens in your browser.
         </p>
       </div>
-      {status === "loading" ? (
-        <Card>
-          <CardHeader>
-            <CardTitle>Opening your library</CardTitle>
-            <CardDescription>Checking your access.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Spinner />
-          </CardContent>
-        </Card>
-      ) : status === "signed-out" ? (
-        <LoginForm />
-      ) : status === "needs-setup" ? (
-        <SetupForm />
-      ) : (
-        <UnlockForm />
-      )}
+      <LoginForm />
     </section>
   );
 }

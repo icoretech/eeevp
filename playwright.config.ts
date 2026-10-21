@@ -14,7 +14,7 @@ export default defineConfig({
     browserName: "chromium",
     actionTimeout: 20_000,
     viewport: { width: 1440, height: 1000 },
-    // Traces include private links and password input: retain only explicit, masked evidence.
+    // Traces can include authentication material: retain only explicit, masked evidence.
     trace: "off",
     screenshot: "off",
     video: "off",

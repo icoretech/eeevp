@@ -1,11 +1,6 @@
-// Private library access uses signed HttpOnly cookies; browser decryption keys never enter sessions.
+// Opaque signed sessions and Origin checks protect request flow; they do not prove knowledge of an encryption key.
 import "server-only";
-import {
-  createHash,
-  createHmac,
-  randomBytes,
-  timingSafeEqual,
-} from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { NextRequest, NextResponse } from "next/server";
 import type { ServerConfig } from "./config";
 import { HttpError } from "./http";
@@ -13,17 +8,10 @@ import { HttpError } from "./http";
 export const SESSION_COOKIE = "eeevp-session";
 const SESSION_SECONDS = 60 * 60 * 8;
 
-function digest(value: string) {
-  return createHash("sha256").update(value).digest();
-}
-
-export function passwordMatches(password: string, config: ServerConfig) {
-  return timingSafeEqual(digest(password), digest(config.LIBRARY_PASSWORD));
-}
-
 export function createSession(config: ServerConfig, now = Date.now()) {
   const payload = Buffer.from(
     JSON.stringify({
+      sessionVersion: 2,
       expiresAt: now + SESSION_SECONDS * 1000,
       nonce: randomBytes(16).toString("base64url"),
     }),
@@ -68,7 +56,9 @@ export function validSession(
     if (
       typeof record !== "object" ||
       record === null ||
-      !("expiresAt" in record)
+      !("expiresAt" in record) ||
+      !("sessionVersion" in record) ||
+      record.sessionVersion !== 2
     )
       return false;
     return (
@@ -86,12 +76,12 @@ export function authenticated(request: NextRequest, config: ServerConfig) {
   return validSession(request.cookies.get(SESSION_COOKIE)?.value, config);
 }
 
-export function requireLibrarySession(
+export async function requireLibrarySession(
   request: NextRequest,
   config: ServerConfig,
 ) {
   if (!authenticated(request, config))
-    throw new HttpError(401, "Library sign-in required");
+    throw new HttpError(401, "Library session required");
 }
 
 export function setSessionCookie(

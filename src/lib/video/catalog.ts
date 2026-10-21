@@ -1,4 +1,4 @@
-// The authenticated server catalog is canonical; names and per-video keys are opened only in the browser.
+// The session-backed server catalog is canonical; names and per-video keys are opened only in the browser.
 import { z } from "zod";
 import { unwrapVideoKey } from "@/lib/crypto/library-crypto";
 import { decryptMetadata } from "@/lib/crypto/video-crypto";
@@ -6,7 +6,7 @@ import { type LibraryVideo, libraryVideoSchema } from "@/lib/video/schema";
 
 export class LibrarySessionExpired extends Error {
   constructor() {
-    super("Your library session expired. Sign in again.");
+    super("Your library session expired. Enter your encryption key again.");
   }
 }
 
@@ -28,15 +28,15 @@ export async function libraryRequest(path: string, init: RequestInit = {}) {
 export async function openLibraryVideo(
   video: LibraryVideo,
   key: string,
-  libraryId: string,
+  libraryId: string | null,
 ) {
-  if (video.libraryId !== libraryId)
+  if (libraryId !== null && video.libraryId !== libraryId)
     throw new Error("This video belongs to a different encrypted library.");
   const videoKey = await unwrapVideoKey(
     video.manifest,
     video.wrappedKey,
     key,
-    libraryId,
+    video.libraryId,
   );
   const metadata = await decryptMetadata(video.manifest, videoKey);
   return { metadata, credentials: { id: video.manifest.id, key: videoKey } };
@@ -45,7 +45,7 @@ export async function openLibraryVideo(
 const catalogSchema = z.strictObject({ videos: z.array(libraryVideoSchema) });
 export async function fetchLibraryCatalog(
   key: string,
-  libraryId: string,
+  libraryId: string | null,
   signal: AbortSignal,
 ) {
   const response = await libraryRequest("/api/videos", { signal });

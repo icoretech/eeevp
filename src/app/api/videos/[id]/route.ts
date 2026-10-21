@@ -8,6 +8,7 @@ import {
   json,
   readBody,
   requireOrigin,
+  requireWritableLibrary,
 } from "@/lib/server/http";
 import { withStorage } from "@/lib/server/storage";
 import { videoIdSchema } from "@/lib/video/schema";
@@ -20,7 +21,7 @@ export async function GET(
 ) {
   return handleApi(async () => {
     const config = getConfig();
-    requireLibrarySession(request, config);
+    await requireLibrarySession(request, config);
     const params = await context.params;
     const parsed = videoIdSchema.safeParse(params.id);
     if (!parsed.success) throw new HttpError(404, "Video not found");
@@ -36,7 +37,8 @@ export async function DELETE(
 ) {
   return handleApi(async () => {
     const config = getConfig();
-    requireLibrarySession(request, config);
+    requireWritableLibrary(config);
+    await requireLibrarySession(request, config);
     requireOrigin(request, config);
     await readBody(request, 0);
     const params = await context.params;

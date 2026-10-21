@@ -37,6 +37,14 @@ export async function handleApi(action: () => Promise<Response>) {
   }
 }
 
+export function requireWritableLibrary(config: ServerConfig) {
+  if (config.DEMO_MODE)
+    throw new HttpError(
+      403,
+      "This demo is read-only. Uploads and deletion are disabled.",
+    );
+}
+
 export function requireOrigin(request: NextRequest, config: ServerConfig) {
   if (request.headers.get("origin") !== config.APP_ORIGIN) {
     throw new HttpError(403, "Request origin is not allowed");
