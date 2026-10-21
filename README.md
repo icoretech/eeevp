@@ -4,6 +4,8 @@
 
 **Zero-trust streaming concept. Encrypt before upload. Decrypt while watching.**
 
+**[Open the demo](https://eeevp.synteq.app)** · [Source repository](https://github.com/icoretech/eeevp)
+
 EEEVP means **encrypted end-to-end video player**. Enter a key to open your library. The matching encryption key reveals filenames and plays the videos; a wrong key leaves encrypted names unreadable. Video content and filenames are encrypted before upload, and the browser decrypts the bytes needed for playback and seeking.
 
 Public demo mode is read-only and uses synthetic samples with an intentionally public key prefilled in an editable field. Its gate shows the key and login action; import and generation tools are hidden. Use the prefilled key to watch, or change it to see unreadable encrypted names. Private use requires a different key and storage namespace.
@@ -85,7 +87,7 @@ The design is motivated by exploring browser-encrypted multimedia delivery for f
 | Streaming | Service Worker, HTTP byte ranges, native HTML video |
 | Validation | Zod 4 |
 | Local development storage | Atomic files on a persistent Compose volume |
-| Hosted target | Synteq Apps with one fixed Cloudflare R2 bucket |
+| Hosted runtime | Synteq Apps with one fixed Cloudflare R2 bucket |
 | Object API | AWS SDK for JavaScript v3, R2 S3-compatible API |
 | Runtime and packaging | Node.js 26, Yarn 4, Next.js standalone Docker image |
 | Verification | Vitest, Playwright Chromium and Firefox, Biome, React Doctor |
@@ -98,11 +100,11 @@ The decryption HUD reserves 56 px and displays at most 32 cells, with UI notific
 
 ## Deployment on Synteq
 
-The hosted target is **one Synteq App and one fixed Cloudflare R2 bucket**. Synteq builds the repository's Dockerfile and provides HTTPS; the image packages the worker and Next.js standalone server, with `/api/health` for readiness. The bucket is deployment configuration, with no bucket selector in the application. No Serverless Functions are implemented.
+The [live demo](https://eeevp.synteq.app) runs on **one Synteq App and one fixed Cloudflare R2 bucket**. Synteq builds the repository's Dockerfile and provides HTTPS; the image packages the worker and Next.js standalone server, with `/api/health` for readiness. The bucket is deployment configuration, with no bucket selector in the application. No Serverless Functions are implemented.
 
 Production demo configuration uses `DEMO_MODE=true` and a dedicated intentionally public `DEMO_PUBLIC_KEY`. The UI prefills that key without hardcoding it in source. The server returns `403` for initialization, upload, chunk writes, completion, and deletion; reading, searching, and playback remain available.
 
-The [Apps runtime](https://cloud.synteq.com/docs/apps-overview#runtime-environment) uses a temporary local filesystem. The hosted design therefore keeps the encrypted catalog, video chunks, library descriptor, and deletion markers in R2. Local development uses the persistent filesystem volume in Docker Compose. Follow the [deployment guide](docs/deployment.md) for the configuration and verification steps.
+The [Apps runtime](https://cloud.synteq.com/docs/apps-overview#runtime-environment) uses a temporary local filesystem. The hosted app therefore keeps the encrypted catalog, video chunks, library descriptor, and deletion markers in R2. Local development uses the persistent filesystem volume in Docker Compose. Follow the [deployment guide](docs/deployment.md) for configuration and verification.
 
 The [event rules](https://hack.synteq.app/rules) require a live `<name>.synteq.app` URL. Platform background: [Synteq Apps and Serverless Functions launch announcement — October 20, 2026](https://synteq.com/blogs/introducing-synteq-apps-and-serverless-functions).
 
@@ -142,6 +144,8 @@ Verification coverage:
 | Live R2 | [Object IO](tests/integration/r2-object-store.test.ts) and [library records](tests/integration/storage-s3.test.ts): competing immutable writes, paginated listing, bounded reads, new-instance visibility, completion, and deletion markers |
 | Read-only APIs | [Demo mode](tests/integration/demo-mode.test.ts): all five library mutation routes return `403`, seeded files remain unchanged, and sessions and reads remain available |
 | Decryption HUD | [Real activity](tests/demo-browser/decryption-activity.spec.ts): verified counters, repeat-seek pulses, stable video/geometry, reduced motion, and no chunk requests or activity with a wrong key |
+
+Firefox 157 can log service-worker interception errors when its native player cancels byte-range requests during seeking. The same messages were reproduced with a minimal pass-through service worker; the 90-second sample still decoded and sought without a `MediaError`. These console messages are a known compatibility finding, not evidence of a failed decryption. See the [browser compatibility note](docs/architecture.md#browser-compatibility).
 
 ## Credits
 

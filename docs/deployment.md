@@ -1,6 +1,8 @@
 # Deployment
 
-The hosted target is a read-only public demo on one Synteq App backed by one private Cloudflare R2 bucket. It uses synthetic samples and an intentionally public prefilled key. Synteq supplies the runtime and HTTPS. R2 holds the library descriptor, encrypted catalog, chunks, drafts, and deletion markers. The bucket is deployment configuration, with no selector in the UI.
+The [live public demo](https://eeevp.synteq.app) runs read-only on one Synteq App backed by one private Cloudflare R2 bucket. It uses synthetic samples and an intentionally public prefilled key. Synteq supplies the runtime and HTTPS. R2 holds the library descriptor, encrypted catalog, chunks, drafts, and deletion markers. The bucket is deployment configuration, with no selector in the UI.
+
+The app was deployed on October 21, 2026. Its current Synteq plan is `free`, with 250m CPU and 512 MiB RAM. The plan's base price does not establish unlimited usage or a hard spending cap; inspect current metering and billing before changing resources or traffic expectations.
 
 Synteq Apps uses temporary local disk, so hosting requires the S3 driver. Local development uses the filesystem driver and a persistent Compose volume. The [hackathon rules](https://hack.synteq.app/rules) require a live `<name>.synteq.app` URL.
 

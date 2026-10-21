@@ -1,6 +1,6 @@
 # Architecture
 
-EEEVP is a video library with browser-held encryption keys. One Next.js application serves encrypted metadata and video chunks from durable storage. The hosted target uses Synteq Apps and one fixed Cloudflare R2 bucket; local development uses a persistent filesystem volume.
+EEEVP is a video library with browser-held encryption keys. One Next.js application serves encrypted metadata and video chunks from durable storage. The [hosted demo](https://eeevp.synteq.app) runs on Synteq Apps with one fixed Cloudflare R2 bucket; local development uses a persistent filesystem volume.
 
 ## Browser workspace and session
 
@@ -47,6 +47,14 @@ Closing or locking playback removes the worker session and aborts in-flight requ
 Playback preserves the original MP4 or WebM file, up to 2 GiB. Codec support depends on the browser. There is no server-side transcoding, FFmpeg processing, server media job queue, or generated preview. Synteq Apps hosts the Next.js service; no Serverless Functions are implemented.
 
 The acceptance fixture is a prepared 90-second WebM containing 24,755,386 bytes across 24 chunks, with valid duration and cues for range checks. Fixture preparation does not represent a server-side transcoding path or support for additional media types.
+
+### Browser compatibility
+
+Firefox 157 reported four service-worker interception console errors alongside native byte-range cancellation during seeking (`NS_ERROR_PARSED_DATA_CACHED`). A controlled comparison reproduced the same four messages with only `respondWith(fetch(request))`, while direct HTTP playback produced none. Both paths decoded the 90-second sample and sought without a `MediaError`.
+
+This observation separates a browser/service-worker console diagnostic from encrypted-chunk authentication. It does not establish that all Firefox console errors are harmless or claim a clean console across browsers. Actual media failures and failed authentication remain errors; native request cancellation must release the relevant stream without presenting failed decryption.
+
+The source comparison is pinned to the [Firefox revision used by Playwright 1.64.1](https://github.com/microsoft/playwright/blob/v1.64.1/browser_patches/firefox/UPSTREAM_CONFIG.sh). Mozilla's [native media channel cancellation](https://github.com/mozilla-firefox/firefox/blob/fdd757a2e09c9471cddf383e64e631e4ce178499/dom/media/ChannelMediaResource.cpp#L697) and [failed service-worker body logging](https://github.com/mozilla-firefox/firefox/blob/fdd757a2e09c9471cddf383e64e631e4ce178499/dom/serviceworkers/FetchEventOpChild.cpp#L114) explain the relevant paths; the controlled playback result remains separate runtime evidence.
 
 ## Decryption activity
 

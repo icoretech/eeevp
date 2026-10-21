@@ -52,22 +52,23 @@ async function setup(
       }),
   );
   const notify = vi.fn();
+  const getClient = vi.fn(async (id: string) => ({
+    id,
+    type: "window",
+    url: `${origin}/watch/${video.manifest.id}`,
+    postMessage: notify,
+  }));
   const service = new PlaybackService({
     origin,
     fetch: fetcher,
-    getClient: async (id) => ({
-      id,
-      type: "window",
-      url: `${origin}/watch/${video.manifest.id}`,
-      postMessage: notify,
-    }),
+    getClient,
   });
   const sessionId = crypto.randomUUID();
   expect(
     await service.unlock(ownerId, { type: "unlock", sessionId, ...video }),
   ).toEqual({ ok: true });
   const url = `${origin}/__eeevp_media__/${sessionId}`;
-  return { service, sessionId, fetcher, notify, url };
+  return { service, sessionId, fetcher, notify, getClient, url };
 }
 
 function bodyReader(response: Response) {
@@ -406,6 +407,32 @@ describe("encrypted video progressive playback", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["client lookup unavailable", "owner window closed"])(
+    "preserves session expiry when its notification cannot complete: %s",
+    async (failure) => {
+      const video = await encryptedVideo(19);
+      const { service, getClient, notify, url } = await setup(
+        video,
+        async () => new Response(null, { status: 401 }),
+      );
+      if (failure === "client lookup unavailable") {
+        getClient.mockRejectedValue(new Error("Client lookup unavailable"));
+      } else {
+        notify.mockImplementation(() => {
+          throw new Error("Owner window closed");
+        });
+      }
+
+      await expect(
+        service.respond(ownerId, new Request(url)).arrayBuffer(),
+      ).rejects.toThrow(
+        "Your library session expired. Sign in and unlock the library again.",
+      );
+      expect(getClient).toHaveBeenCalledTimes(1);
+      expect(service.respond(ownerId, new Request(url)).status).toBe(403);
+    },
+  );
+
   it("backpressures full playback to one decrypted chunk per read", async () => {
     const video = await encryptedVideo(CHUNK_SIZE * 2 + 11);
     const { service, fetcher, url } = await setup(video);
@@ -597,6 +624,94 @@ describe("encrypted video progressive playback", () => {
     expect(await reading).toEqual({ done: true, value: undefined });
   });
 
+  it("settles a native media request abort before the reader cancel callback without a stream error", async () => {
+    const video = await encryptedVideo(19);
+    const started = Promise.withResolvers<AbortSignal>();
+    const { service, fetcher, notify, url } = await setup(
+      video,
+      (_input, init) => {
+        const signal = init?.signal;
+        if (!signal) throw new Error("Expected an abortable chunk fetch.");
+        started.resolve(signal);
+        return new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      },
+    );
+    const request = new AbortController();
+    const reader = bodyReader(
+      service.respond(ownerId, new Request(url, { signal: request.signal })),
+    );
+    const reading = reader.read();
+    const chunkRequest = await started.promise;
+    request.abort(
+      new DOMException(
+        "The media range was superseded by a seek.",
+        "AbortError",
+      ),
+    );
+
+    await expect(reading).resolves.toEqual({ done: true, value: undefined });
+    expect(chunkRequest.aborted).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("finishes an already-aborted media request without starting a ciphertext fetch", async () => {
+    const video = await encryptedVideo(19);
+    const { service, fetcher, notify, url } = await setup(video);
+    const request = new AbortController();
+    request.abort();
+    const response = service.respond(
+      ownerId,
+      new Request(url, { signal: request.signal }),
+    );
+
+    expect((await response.arrayBuffer()).byteLength).toBe(0);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("leaves an already-canceled response alone when its media request also aborts", async () => {
+    const video = await encryptedVideo(19);
+    const started = Promise.withResolvers<AbortSignal>();
+    const { service, notify, url } = await setup(video, (_input, options) => {
+      const signal = options?.signal;
+      if (!signal) throw new Error("Expected an abortable chunk fetch.");
+      started.resolve(signal);
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), {
+          once: true,
+        });
+      });
+    });
+    const request = new AbortController();
+    const reader = bodyReader(
+      service.respond(ownerId, new Request(url, { signal: request.signal })),
+    );
+    const reading = reader.read();
+    await started.promise;
+    await reader.cancel();
+    request.abort();
+    expect(await reading).toEqual({ done: true, value: undefined });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("retains a real chunk fetch abort as an error while the media request remains active", async () => {
+    const video = await encryptedVideo(19);
+    const { service, notify, url } = await setup(video, async () => {
+      throw new DOMException("Ciphertext transport aborted", "AbortError");
+    });
+
+    await expect(
+      service.respond(ownerId, new Request(url)).arrayBuffer(),
+    ).rejects.toThrow("Secure playback failed");
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   it("aborts an active request as soon as its owner locks playback", async () => {
     const video = await encryptedVideo(19);
     const started = Promise.withResolvers<AbortSignal>();
@@ -614,12 +729,10 @@ describe("encrypted video progressive playback", () => {
       },
     );
     const reader = bodyReader(service.respond(ownerId, new Request(url)));
-    const reading = expect(reader.read()).rejects.toThrow(
-      "Secure playback failed",
-    );
+    const reading = reader.read();
     const signal = await started.promise;
     service.lock(ownerId, sessionId);
-    await reading;
+    expect(await reading).toEqual({ done: true, value: undefined });
     expect(signal.aborted).toBe(true);
     expect(service.respond(ownerId, new Request(url)).status).toBe(403);
   });

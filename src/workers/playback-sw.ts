@@ -331,13 +331,16 @@ export class PlaybackService {
             );
             if (response.status === 401) {
               this.lock(ownerId, sessionId);
-              const client = await this.runtime.getClient(ownerId);
-              client?.postMessage({
-                type: "playback-error",
-                sessionId,
-                code: "session-expired",
-                message: SESSION_EXPIRED,
-              });
+              try {
+                session.activityClient.postMessage({
+                  type: "playback-error",
+                  sessionId,
+                  code: "session-expired",
+                  message: SESSION_EXPIRED,
+                });
+              } catch {
+                // A vanished owner cannot receive the notice; the response still fails as session-expired.
+              }
               throw new Error(SESSION_EXPIRED);
             }
             const packet = await readPacket(response, expectedSize + 28);
@@ -379,13 +382,21 @@ export class PlaybackService {
           } catch (error) {
             cleanup();
             if (!cancelled) {
-              controller.error(
-                error instanceof Error && error.message === SESSION_EXPIRED
-                  ? error
-                  : new Error(
-                      "Secure playback failed. Open the video again or unlock the library.",
-                    ),
-              );
+              // Seek cancellation or an owner lock may precede the stream's cancel callback.
+              if (
+                (request.signal.aborted || session.locked) &&
+                !(error instanceof Error && error.message === SESSION_EXPIRED)
+              )
+                controller.close();
+              else {
+                controller.error(
+                  error instanceof Error && error.message === SESSION_EXPIRED
+                    ? error
+                    : new Error(
+                        "Secure playback failed. Open the video again or unlock the library.",
+                      ),
+                );
+              }
             }
           }
         },

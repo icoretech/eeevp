@@ -5,6 +5,7 @@ node_modules
 .env*
 .omo
 .sisyphus
+.synteq
 .DS_Store
 coverage
 test-results
