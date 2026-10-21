@@ -4,7 +4,7 @@
 
 **Zero-trust streaming concept. Encrypt before upload. Decrypt while watching.**
 
-**[Open the demo](https://eeevp.synteq.app)** · [Source repository](https://github.com/icoretech/eeevp)
+**[Open the demo](https://eeevp.synteq.app)** · [Source repository](https://github.com/icoretech/eeevp) · **Open source · [MIT License](LICENSE)**
 
 EEEVP means **encrypted end-to-end video player**. Enter a key to open your library. The matching encryption key reveals filenames and plays the videos; a wrong key leaves encrypted names unreadable. Video content and filenames are encrypted before upload, and the browser decrypts the bytes needed for playback and seeking.
 

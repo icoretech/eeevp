@@ -1,6 +1,7 @@
 {
   "name": "eeevp",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "packageManager": "yarn@4.18.1",
   "devDependencies": {

@@ -1,0 +1,20 @@
+Use case: ads-marketing.
+Asset type: one finished landscape social launch banner for an X announcement, wide 16:9 composition, ideally 2048 x 1152.
+Primary request: create a distinctive, polished launch graphic for EEEVP, an MIT open-source end-to-end encrypted video streaming concept built for Synteq Hack(athon) 2026. This is an actual finished banner, not a presentation board or a website mockup.
+
+Art direction: confident Swiss editorial typography paired with a precise, memorable geometric illustration. Use the product's established palette only: deep forest green #233C31, warm ivory #F7F7F2, muted sage #A5B197 and olive #6F8562. Predominantly deep forest background with ivory typography, very restrained fine grid detail, crisp edges, premium spacing. Bold and immediately legible in a social-feed thumbnail.
+
+Composition: generous safe margins. Top-left: a small mark of three simple vertical bars at different heights beside the exact wordmark EEEVP. Large left-hand headline across two lines. The right half contains a single elegant abstract browser window: a stream of scrambled little rectangular encrypted blocks resolves into a clean video frame with a play triangle ONLY inside the browser boundary. The key metaphor stays inside that browser frame. Make the encrypted-block-to-playable-video transformation the memorable visual, not a generic cloud or a padlock stock icon. Confident sparse layout with clear visual hierarchy, not a dense diagram. No fake product screenshot or invented UI copy.
+
+Render the following text verbatim, and no other text:
+Wordmark: "EEEVP."
+Small upper label: "OPEN SOURCE / MIT"
+Main headline: "Your browser
+holds the key."
+Supporting line: "END-TO-END ENCRYPTED STREAMING"
+Lower caption: "BUILT FOR SYNTEQ HACK(ATHON) 2026"
+URL: "eeevp.synteq.app"
+
+Typography: very large, tightly crafted bold sans-serif headline, clean sans-serif wordmark, restrained monospaced small labels. Maintain very strong contrast and ample separation between text and illustration. Everything should look intentionally designed and ready to publish.
+
+Avoid: neon cyberpunk, gradients, hooded hackers, shields, oversized padlocks, coins, blockchain imagery, robots, stock photos, generic SaaS cards, heavy shadows, tiny illegible paragraphs, random code strings, watermarks, false partner logos, typos, added slogans.
