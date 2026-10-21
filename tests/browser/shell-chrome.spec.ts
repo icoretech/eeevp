@@ -63,7 +63,7 @@ test("shows configured storage and official footer links before entry, while ope
   await expect(socialLinks.getByRole("link")).toHaveCount(2);
   await expect(
     socialLinks.getByRole("link", { name: "icoretech", exact: true }),
-  ).toHaveAttribute("href", "https://github.com/icoretech");
+  ).toHaveAttribute("href", "https://github.com/icoretech/eeevp");
   await expect(
     socialLinks.getByRole("link", { name: "@icoretech_inc", exact: true }),
   ).toHaveAttribute("href", "https://x.com/icoretech_inc");

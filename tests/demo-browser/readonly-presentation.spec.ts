@@ -83,7 +83,7 @@ async function presentationGeometry(page: Page) {
   });
   await expect(links.getByRole("link")).toHaveCount(2);
   for (const [name, href] of [
-    ["icoretech", "https://github.com/icoretech"],
+    ["icoretech", "https://github.com/icoretech/eeevp"],
     ["@icoretech_inc", "https://x.com/icoretech_inc"],
   ] as const) {
     const link = links.getByRole("link", { name, exact: true });

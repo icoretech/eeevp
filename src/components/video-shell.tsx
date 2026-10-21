@@ -46,7 +46,7 @@ export async function VideoShell({ children }: { children: ReactNode }) {
         </div>
         <nav className="footer-links" aria-label="EEEVP social links">
           <Link
-            href="https://github.com/icoretech"
+            href="https://github.com/icoretech/eeevp"
             target="_blank"
             rel="noopener noreferrer"
           >
