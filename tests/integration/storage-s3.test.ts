@@ -109,6 +109,8 @@ it.skipIf(process.env.S3_CONTRACT_TEST !== "true")(
           ),
         ),
       ).toEqual(plaintext.slice(CHUNK_SIZE));
+      // The warm manifest cache must still obey deletion from another replica.
+      expect(await replica.readChunk(id, 1)).toEqual(packet);
       await storage.deleteVideo(id);
       expect(await raw.head(`tombstones/videos/${id}.json`)).not.toBeNull();
       await expect(replica.readable(id)).rejects.toMatchObject({ status: 404 });
@@ -118,6 +120,10 @@ it.skipIf(process.env.S3_CONTRACT_TEST !== "true")(
       ).rejects.toMatchObject({ status: 404 });
       // A delayed writer may finish after physical cleanup; the permanent tombstone still wins.
       await raw.publish(`videos/${id}/manifest.json`, JSON.stringify(record));
+      await raw.publish(`videos/${id}/chunks/1`, packet);
+      await expect(replica.readChunk(id, 1)).rejects.toMatchObject({
+        status: 404,
+      });
       expect(await replica.list()).toEqual([]);
       await expect(replica.readable(id)).rejects.toMatchObject({ status: 404 });
       await replica.deleteVideo(id);

@@ -446,14 +446,147 @@ describe("encrypted video progressive playback", () => {
     expect(fetcher).not.toHaveBeenCalled();
     const first = await reader.read();
     expect(first.value).toEqual(video.bytes.slice(0, CHUNK_SIZE));
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(3);
     const second = await reader.read();
     expect(second.value).toEqual(video.bytes.slice(CHUNK_SIZE, CHUNK_SIZE * 2));
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher).toHaveBeenCalledTimes(3);
     const last = await reader.read();
     expect(last.value).toEqual(video.bytes.slice(CHUNK_SIZE * 2));
     expect(fetcher).toHaveBeenCalledTimes(3);
     expect(await reader.read()).toEqual({ done: true, value: undefined });
+  });
+
+  it("starts a bounded parallel window, decrypts only consumed packets and cancels lookahead on seek", async () => {
+    const video = await encryptedVideo(CHUNK_SIZE * 4 + 19);
+    const pending = new Map<
+      number,
+      ReturnType<typeof Promise.withResolvers<Response>>
+    >();
+    const signals = new Map<number, AbortSignal>();
+    const { service, fetcher, notify, url } = await setup(
+      video,
+      (input, init) => {
+        const index = Number(String(input).split("/").at(-1));
+        const gate = Promise.withResolvers<Response>();
+        const signal = init?.signal;
+        if (!signal) throw new Error("Expected abortable packets");
+        signals.set(index, signal);
+        pending.set(index, gate);
+        signal.addEventListener("abort", () => gate.reject(signal.reason));
+        return gate.promise;
+      },
+    );
+    const reader = bodyReader(service.respond(ownerId, new Request(url)));
+    const reading = reader.read();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect([...pending.keys()]).toEqual([0, 1, 2]);
+    expect(notify).not.toHaveBeenCalled();
+    pending.get(0)?.resolve(new Response(video.packets[0]));
+    expect((await reading).value).toEqual(video.bytes.slice(0, CHUNK_SIZE));
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    await reader.cancel();
+    expect(signals.get(1)?.aborted).toBe(true);
+    expect(signals.get(2)?.aborted).toBe(true);
+    const cached = service.respond(
+      ownerId,
+      new Request(url, { headers: { Range: "bytes=7-29" } }),
+    );
+    expect(new Uint8Array(await cached.arrayBuffer())).toEqual(
+      video.bytes.slice(7, 30),
+    );
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps overlapping readers alive when one cancels, then flushes ciphertext on lock", async () => {
+    const video = await encryptedVideo(19);
+    const gate = Promise.withResolvers<Response>();
+    const { service, fetcher, sessionId, url } = await setup(
+      video,
+      () => gate.promise,
+    );
+    const first = bodyReader(service.respond(ownerId, new Request(url)));
+    const second = bodyReader(service.respond(ownerId, new Request(url)));
+    const readingFirst = first.read();
+    const readingSecond = second.read();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await first.cancel();
+    gate.resolve(new Response(video.packets[0]));
+    expect(await readingFirst).toEqual({ done: true, value: undefined });
+    expect((await readingSecond).value).toEqual(video.bytes);
+    service.lock(ownerId, sessionId);
+    expect(await service.unlock(ownerId, { sessionId, ...video })).toEqual({
+      ok: true,
+    });
+    fetcher.mockImplementation(async () => new Response(video.packets[0]));
+    expect(
+      new Uint8Array(
+        await service.respond(ownerId, new Request(url)).arrayBuffer(),
+      ),
+    ).toEqual(video.bytes);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("evicts failed authentication instead of reusing corrupt ciphertext on retry", async () => {
+    const video = await encryptedVideo(19);
+    const packet = video.packets[0];
+    if (!packet) throw new Error("Expected packet");
+    const corrupt = new Uint8Array(packet.slice(0));
+    corrupt[12] = (corrupt[12] ?? 0) ^ 1;
+    const { service, fetcher, notify, url } = await setup(
+      video,
+      async () => new Response(corrupt),
+    );
+    await expect(
+      service.respond(ownerId, new Request(url)).arrayBuffer(),
+    ).rejects.toThrow("Secure playback failed");
+    expect(notify).not.toHaveBeenCalled();
+    fetcher.mockImplementation(async () => new Response(packet));
+    expect(
+      new Uint8Array(
+        await service.respond(ownerId, new Request(url)).arrayBuffer(),
+      ),
+    ).toEqual(video.bytes);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("revalidates after ciphertext TTL and fails closed on session expiry", async () => {
+    const video = await encryptedVideo(19);
+    const { service, fetcher, url, notify } = await setup(video);
+    await service.respond(ownerId, new Request(url)).arrayBuffer();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 30_001);
+    fetcher.mockImplementation(async () => new Response(null, { status: 401 }));
+    await expect(
+      service.respond(ownerId, new Request(url)).arrayBuffer(),
+    ).rejects.toThrow("session expired");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(service.respond(ownerId, new Request(url)).status).toBe(403);
+    expect(notify.mock.calls.at(-1)?.[0]).toMatchObject({
+      code: "session-expired",
+    });
+  });
+
+  it("revokes all streaming when a speculative packet returns 401", async () => {
+    const video = await encryptedVideo(CHUNK_SIZE * 3 + 19);
+    const { service, url, notify } = await setup(video, async (input) => {
+      const index = Number(String(input).split("/").at(-1));
+      if (index === 1) return new Response(null, { status: 401 });
+      return new Response(video.packets[index]);
+    });
+    await expect(
+      service.respond(ownerId, new Request(url)).arrayBuffer(),
+    ).rejects.toThrow("session expired");
+    expect(service.respond(ownerId, new Request(url)).status).toBe(403);
+    expect(
+      notify.mock.calls.some(
+        ([message]) => message.type === "decryption-activity",
+      ),
+    ).toBe(false);
   });
 
   it.each(["bytes=-11", `bytes=${CHUNK_SIZE * 2}-`])(

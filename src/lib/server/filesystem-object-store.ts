@@ -58,11 +58,13 @@ export class FilesystemObjectStore implements ObjectStore {
     return join(this.root, key);
   }
 
-  async read(key: string, limit: number) {
+  async read(key: string, limit: number, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     if (!Number.isSafeInteger(limit) || limit < 0)
       throw new Error("Invalid read limit");
     const path = await this.path(key);
-    return path ? readStoredFile(path, limit) : null;
+    signal?.throwIfAborted();
+    return path ? readStoredFile(path, limit, signal) : null;
   }
 
   async publish(key: string, body: string | Uint8Array) {
@@ -71,8 +73,10 @@ export class FilesystemObjectStore implements ObjectStore {
     return publishStoredFile(path, body, false);
   }
 
-  async head(key: string) {
+  async head(key: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     const path = await this.path(key);
+    signal?.throwIfAborted();
     if (!path) return null;
     try {
       const handle = await open(
@@ -81,6 +85,7 @@ export class FilesystemObjectStore implements ObjectStore {
       );
       try {
         const stat = await handle.stat();
+        signal?.throwIfAborted();
         if (!stat.isFile()) throw new Error("Invalid stored object");
         return { size: stat.size };
       } finally {

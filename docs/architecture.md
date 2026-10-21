@@ -42,6 +42,8 @@ The browser opens `/watch/:id`, fetches its encrypted record through the session
 
 A service worker creates an in-memory playback session bound to the initiating browser client. The native video element requests a virtual media URL using ordinary byte ranges. The worker fetches encrypted chunks, authenticates and decrypts them, then streams only the requested plaintext bytes to the media decoder.
 
+Downloads use a sliding window of three packets within the requested byte range. Overlapping readers share in-flight downloads; canceling one reader releases its leases without interrupting another reader of the same packet. Ciphertext is reused in an in-memory LRU with an 8 MiB limit per playback session, 32 MiB across the worker, and a 30-second expiry. The worker never persists this cache or caches plaintext. Cached packets are authenticated again when consumed; speculative downloads alone do not produce HUD verification events. Lock and any expired-session response immediately clear the session's packets and pending downloads.
+
 Closing or locking playback removes the worker session and aborts in-flight requests. If the browser terminates an idle service worker, a later media request can restore its session from the exact still-open owner window through a private MessageChannel. Restoration is bounded, coalesces concurrent requests, and refuses canceled or locked sessions. Active keys remain in browser memory, without keepalive traffic or persisted recovery state. Closing or reloading ends that active session; the public demo key can be supplied again through its prefill. This browser-local state does not require application-server affinity.
 
 Playback preserves the original MP4 or WebM file, up to 2 GiB. Codec support depends on the browser. There is no server-side transcoding, FFmpeg processing, server media job queue, or generated preview. Synteq Apps hosts the Next.js service; no Serverless Functions are implemented.
@@ -67,6 +69,8 @@ The display reserves 56 px at all states and uses at most 32 cells. It has no co
 ## Hosted object storage
 
 `STORAGE_DRIVER=s3` selects one configured bucket and required `S3_PREFIX` namespace. Every replica uses it for the library descriptor, committed catalog, encrypted chunks, drafts, and deletion markers. Temporary app-local disk is not canonical state.
+
+Chunk reads reuse up to 256 validated immutable manifests per object-store instance. The cache is an optimization, not a source of existence or deletion state: each encrypted packet read ends with a fresh shared tombstone lookup before any bytes are returned. A warm chunk therefore requires one packet GET and one tombstone HEAD. Request cancellation propagates through the storage adapter to pending SDK requests and response bodies. Catalog reads and mutations continue to consult durable storage.
 
 Immutable object publication uses [R2 conditional creation](https://developers.cloudflare.com/r2/api/s3/extensions/#conditional-operations-in-putobject) with `If-None-Match: *`. Reads are bounded, and listing follows all object-list pages. Storage errors fail the request without switching backends or creating an empty replacement catalog.
 

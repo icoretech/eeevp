@@ -68,19 +68,28 @@ export class S3ObjectStore implements ObjectStore {
     return this.prefix + key;
   }
 
-  async read(key: string, limit: number) {
+  async read(key: string, limit: number, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     if (!Number.isSafeInteger(limit) || limit < 0)
       throw new Error("Invalid read limit");
     const controller = new AbortController();
+    const abortSignal = signal
+      ? AbortSignal.any([signal, controller.signal])
+      : controller.signal;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const cancelReader = () => {
+      void reader?.cancel(abortSignal.reason).catch(() => {});
+    };
+    abortSignal.addEventListener("abort", cancelReader, { once: true });
     try {
       const result = await this.client.send(
         new GetObjectCommand({ Bucket: this.bucket, Key: this.key(key) }),
-        { abortSignal: controller.signal },
+        { abortSignal },
       );
       if (!result.Body) throw new Error("Missing object body");
       // The SDK exposes the actual response stream without collecting it first.
       reader = result.Body.transformToWebStream().getReader();
+      abortSignal.throwIfAborted();
       if (
         result.ContentLength !== undefined &&
         checkedSize(result.ContentLength) > limit
@@ -89,7 +98,9 @@ export class S3ObjectStore implements ObjectStore {
       const chunks: Buffer[] = [];
       let length = 0;
       for (;;) {
+        abortSignal.throwIfAborted();
         const chunk = await reader.read();
+        abortSignal.throwIfAborted();
         if (chunk.done) break;
         length += chunk.value.byteLength;
         if (length > limit) throw new Error("Object exceeds read limit");
@@ -104,6 +115,7 @@ export class S3ObjectStore implements ObjectStore {
       if (missing(error)) return null;
       throw error;
     } finally {
+      abortSignal.removeEventListener("abort", cancelReader);
       reader?.releaseLock();
     }
   }
@@ -130,11 +142,14 @@ export class S3ObjectStore implements ObjectStore {
     }
   }
 
-  async head(key: string) {
+  async head(key: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     try {
       const result = await this.client.send(
         new HeadObjectCommand({ Bucket: this.bucket, Key: this.key(key) }),
+        { abortSignal: signal },
       );
+      signal?.throwIfAborted();
       return { size: checkedSize(result.ContentLength) };
     } catch (error) {
       if (missing(error)) return null;

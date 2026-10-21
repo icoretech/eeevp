@@ -11,6 +11,8 @@ import {
   videoIdSchema,
 } from "../lib/video/schema";
 
+import { CiphertextCache, PlaybackPackets } from "./playback-packets";
+
 const MEDIA_PREFIX = "/__eeevp_media__/";
 const MAX_SESSIONS = 32;
 const RESTORE_TIMEOUT = 5_000;
@@ -25,6 +27,8 @@ type PlaybackSession = {
   requests: Set<AbortController>;
   locked: boolean;
   activityClient: BrowserClient;
+  packets: PlaybackPackets;
+  expired: boolean;
 };
 
 type BrowserClient = {
@@ -146,6 +150,7 @@ async function readPacket(response: Response, expectedSize: number) {
 
 // The service is exported to exercise real encryption, streaming, cancellation, and client isolation in tests.
 export class PlaybackService {
+  private cache = new CiphertextCache();
   private sessions = new Map<string, PlaybackSession>();
   private pending = new Map<string, { ownerId: string }>();
   private restoring = new Map<
@@ -220,6 +225,44 @@ export class PlaybackService {
         requests: new Set(),
         locked: false,
         activityClient: client,
+        expired: false,
+        packets: new PlaybackPackets(
+          sessionId.data,
+          this.cache,
+          async (index, signal) => {
+            const response = await this.runtime.fetch(
+              `${this.runtime.origin}/api/videos/${manifest.data.id}/chunks/${index}`,
+              {
+                cache: "no-store",
+                credentials: "same-origin",
+                redirect: "error",
+                signal,
+              },
+            );
+            signal.throwIfAborted();
+            if (response.status === 401) {
+              const session = this.sessions.get(sessionId.data);
+              if (session) session.expired = true;
+              this.lock(ownerId, sessionId.data);
+              try {
+                client.postMessage({
+                  type: "playback-error",
+                  sessionId: sessionId.data,
+                  code: "session-expired",
+                  message: SESSION_EXPIRED,
+                });
+              } catch {
+                /* A closed owner cannot receive the notice. */
+              }
+              throw new Error(SESSION_EXPIRED);
+            }
+            const expected = Math.min(
+              manifest.data.chunkSize,
+              manifest.data.size - index * manifest.data.chunkSize,
+            );
+            return readPacket(response, expected + 28);
+          },
+        ),
       });
       return { ok: true as const };
     } catch {
@@ -241,6 +284,7 @@ export class PlaybackService {
     const session = this.sessions.get(sessionId);
     if (session?.ownerId !== ownerId) return;
     session.locked = true;
+    session.packets.close();
     for (const request of session.requests)
       request.abort(new Error("Playback is locked."));
     session.requests.clear();
@@ -302,11 +346,19 @@ export class PlaybackService {
     request.signal.addEventListener("abort", onAbort, { once: true });
     if (request.signal.aborted) onAbort();
     session.requests.add(abort);
+    const leases = new Map<number, ReturnType<PlaybackPackets["acquire"]>>();
+    const release = () => {
+      for (const lease of leases.values()) lease.release();
+      leases.clear();
+    };
+    abort.signal.addEventListener("abort", release, { once: true });
     let cursor = range.start;
     let cancelled = false;
     const cleanup = () => {
       request.signal.removeEventListener("abort", onAbort);
       session.requests.delete(abort);
+      abort.signal.removeEventListener("abort", release);
+      release();
     };
     const body = new ReadableStream<Uint8Array>(
       {
@@ -320,30 +372,17 @@ export class PlaybackService {
               manifest.chunkSize,
               manifest.size - chunkStart,
             );
-            const response = await this.runtime.fetch(
-              `${this.runtime.origin}/api/videos/${manifest.id}/chunks/${index}`,
-              {
-                cache: "no-store",
-                credentials: "same-origin",
-                redirect: "error",
-                signal: abort.signal,
-              },
+            const last = Math.min(
+              Math.floor(range.end / manifest.chunkSize),
+              index + 2,
             );
-            if (response.status === 401) {
-              this.lock(ownerId, sessionId);
-              try {
-                session.activityClient.postMessage({
-                  type: "playback-error",
-                  sessionId,
-                  code: "session-expired",
-                  message: SESSION_EXPIRED,
-                });
-              } catch {
-                // A vanished owner cannot receive the notice; the response still fails as session-expired.
-              }
-              throw new Error(SESSION_EXPIRED);
+            for (let next = index; next <= last; next += 1) {
+              if (!leases.has(next))
+                leases.set(next, session.packets.acquire(next));
             }
-            const packet = await readPacket(response, expectedSize + 28);
+            const lease = leases.get(index);
+            if (!lease) throw new Error("Missing playback packet.");
+            const packet = await abortable(lease.promise, abort.signal);
             abort.signal.throwIfAborted();
             const plaintext = new Uint8Array(
               await decryptChunk(
@@ -351,7 +390,10 @@ export class PlaybackService {
                 index,
                 manifest,
                 session.credentials.key,
-              ),
+              ).catch((error: unknown) => {
+                session.packets.invalidate(index);
+                throw error;
+              }),
             );
             abort.signal.throwIfAborted();
             if (session.locked) throw new Error("Playback is locked.");
@@ -375,12 +417,15 @@ export class PlaybackService {
             );
             controller.enqueue(plaintext.subarray(offset, offset + length));
             cursor += length;
+            lease.release();
+            leases.delete(index);
             if (cursor > range.end) {
               controller.close();
               cleanup();
             }
-          } catch (error) {
+          } catch (cause) {
             cleanup();
+            const error = session.expired ? new Error(SESSION_EXPIRED) : cause;
             if (!cancelled) {
               // Seek cancellation or an owner lock may precede the stream's cancel callback.
               if (

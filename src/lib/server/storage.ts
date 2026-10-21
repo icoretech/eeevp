@@ -15,6 +15,24 @@ import { HttpError } from "./http";
 import type { ObjectStore } from "./object-store";
 import { createObjectStore } from "./storage-factory";
 
+const MAX_CHUNK_MANIFESTS = 256;
+// Only positive immutable manifests are cached. Each packet still checks the shared
+// tombstone after its read, so deletion is authoritative across processes/replicas.
+const chunkManifests = new WeakMap<ObjectStore, Map<string, VideoManifest>>();
+
+function parseRecord(body: Buffer, id: string) {
+  try {
+    const record = libraryVideoSchema.parse(
+      JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)),
+    );
+    if (record.manifest.id !== id)
+      throw new Error("Mismatched video identifier");
+    return record;
+  } catch {
+    throw new HttpError(503, "Stored video is unavailable");
+  }
+}
+
 export function expectedChunkLength(manifest: VideoManifest, index: number) {
   if (!Number.isSafeInteger(index) || index < 0 || index >= manifest.chunkCount)
     throw new HttpError(404, "Video chunk not found");
@@ -49,12 +67,13 @@ export class VideoStorage {
     return `tombstones/videos/${parsed.data}.json`;
   }
 
-  private async deleted(id: string) {
-    return (await this.store.head(this.tombstoneKey(id))) !== null;
+  private async deleted(id: string, signal?: AbortSignal) {
+    return (await this.store.head(this.tombstoneKey(id), signal)) !== null;
   }
 
-  private async requirePresent(id: string) {
-    if (await this.deleted(id)) throw new HttpError(404, "Video not found");
+  private async requirePresent(id: string, signal?: AbortSignal) {
+    if (await this.deleted(id, signal))
+      throw new HttpError(404, "Video not found");
   }
 
   ready() {
@@ -65,18 +84,9 @@ export class VideoStorage {
     if (await this.deleted(id)) return null;
     const body = await this.store.read(this.key(id, `${kind}.json`), 65536);
     if (!body) return null;
-    try {
-      const record = libraryVideoSchema.parse(
-        JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)),
-      );
-      if (record.manifest.id !== id)
-        throw new Error("Mismatched video identifier");
-      if (await this.deleted(id)) return null;
-      return record;
-    } catch (error) {
-      if (error instanceof HttpError) throw error;
-      throw new HttpError(503, "Stored video is unavailable");
-    }
+    const record = parseRecord(body, id);
+    if (await this.deleted(id)) return null;
+    return record;
   }
 
   async library() {
@@ -210,15 +220,46 @@ export class VideoStorage {
     return record;
   }
 
-  async readChunk(id: string, index: number) {
-    const video = await this.readable(id);
-    const length = expectedChunkLength(video.manifest, index);
-    const body = await this.store.read(this.key(id, `chunks/${index}`), length);
-    if (!body) throw new HttpError(404, "Video chunk not found");
-    if (body.byteLength !== length)
-      throw new HttpError(503, "Stored video is unavailable");
-    await this.requirePresent(id);
-    return body;
+  async readChunk(id: string, index: number, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    const manifestKey = this.key(id, "manifest.json");
+    let cache = chunkManifests.get(this.store);
+    if (!cache) {
+      cache = new Map();
+      chunkManifests.set(this.store, cache);
+    }
+    try {
+      let manifest = cache.get(id);
+      if (!manifest) {
+        const bytes = await this.store.read(manifestKey, 65536, signal);
+        signal?.throwIfAborted();
+        if (!bytes) throw new HttpError(404, "Video not found");
+        manifest = parseRecord(bytes, id).manifest;
+      }
+      const length = expectedChunkLength(manifest, index);
+      const body = await this.store.read(
+        this.key(id, `chunks/${index}`),
+        length,
+        signal,
+      );
+      signal?.throwIfAborted();
+      if (!body) throw new HttpError(404, "Video chunk not found");
+      if (body.byteLength !== length)
+        throw new HttpError(503, "Stored video is unavailable");
+      // This must follow the object download: a deletion racing with it wins.
+      await this.requirePresent(id, signal);
+      signal?.throwIfAborted();
+      cache.delete(id);
+      cache.set(id, manifest);
+      if (cache.size > MAX_CHUNK_MANIFESTS) {
+        const oldest = cache.keys().next().value;
+        if (oldest !== undefined) cache.delete(oldest);
+      }
+      return body;
+    } catch (error) {
+      cache.delete(id);
+      throw error;
+    }
   }
 
   async deleteVideo(id: string) {

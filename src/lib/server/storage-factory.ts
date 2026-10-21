@@ -24,7 +24,7 @@ export function createObjectStore(config: ServerConfig) {
     .digest("hex");
   if (cachedS3?.signature === signature) return cachedS3.store;
   const store = new S3ObjectStore(settings);
-  // Cache connection pools only; every catalog, record and tombstone is still read from shared storage.
+  // Reuse connections; VideoStorage separately caches immutable manifests, never deletion state.
   cachedS3 = { signature, store };
   return store;
 }

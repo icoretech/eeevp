@@ -56,7 +56,7 @@ export async function GET(request: NextRequest, context: ChunkContext) {
     await requireLibrarySession(request, config);
     const { id, index } = await parseParams(context);
     return withStorage(config, async (storage) => {
-      const packet = await storage.readChunk(id, index);
+      const packet = await storage.readChunk(id, index, request.signal);
       return new Response(new Uint8Array(packet), {
         headers: {
           "Content-Type": "application/octet-stream",

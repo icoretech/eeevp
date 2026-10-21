@@ -10,9 +10,15 @@ export function hasFileCode(error: unknown, code: string) {
   return error instanceof Error && "code" in error && error.code === code;
 }
 
-export async function readStoredFile(path: string, limit: number) {
+export async function readStoredFile(
+  path: string,
+  limit: number,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
   let handle: FileHandle;
   try {
+    signal?.throwIfAborted();
     handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
     if (hasFileCode(error, "ENOENT")) return null;
@@ -25,6 +31,7 @@ export async function readStoredFile(path: string, limit: number) {
     const bytes = Buffer.alloc(Math.min(stat.size, limit) + 1);
     let length = 0;
     while (length < bytes.byteLength) {
+      signal?.throwIfAborted();
       const result = await handle.read(
         bytes,
         length,
@@ -34,6 +41,7 @@ export async function readStoredFile(path: string, limit: number) {
       if (result.bytesRead === 0) break;
       length += result.bytesRead;
     }
+    signal?.throwIfAborted();
     if (length > limit || length !== stat.size)
       throw new HttpError(503, "Stored data is unavailable");
     return bytes.subarray(0, length);
