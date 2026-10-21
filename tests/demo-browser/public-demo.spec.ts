@@ -134,7 +134,27 @@ test("public production demo retains its indexed cloud video and enforces read-o
     );
     expect(hash(source)).toBe(receipt.sourceSha256);
     expect(source.length).toBe(receipt.sourceBytes);
-    expect(catalog).toEqual([receipt.video]);
+    const addedReceipt = await optionalJson(
+      resolve(datasetDirectory, "token-rumble-receipt.json"),
+    );
+    const expectedCatalog = [receipt.video];
+    if (addedReceipt !== null) {
+      const added = z
+        .object({
+          state: z.literal("published"),
+          publicKeyDigest: z.string().length(64),
+          video: libraryVideoSchema,
+        })
+        .parse(addedReceipt);
+      expect(added.publicKeyDigest).toBe(hash(key));
+      expect(added.video.libraryId).toBe(library.id);
+      expectedCatalog.push(added.video);
+    }
+    const byId = (
+      left: z.infer<typeof libraryVideoSchema>,
+      right: z.infer<typeof libraryVideoSchema>,
+    ) => left.manifest.id.localeCompare(right.manifest.id);
+    expect([...catalog].sort(byId)).toEqual(expectedCatalog.sort(byId));
     expect(
       await cloud.read(`videos/${receipt.legacy.id}/manifest.json`),
     ).toBeNull();
@@ -145,7 +165,7 @@ test("public production demo retains its indexed cloud video and enforces read-o
     if (!tombstone) throw new Error("Retired sample tombstone missing");
     expect(hash(tombstone)).toBe(receipt.legacy.tombstoneSha256);
     note(
-      "Promoted v2 receipt, indexed 90-second source and single committed catalog record match; old sample remains retired",
+      "Promoted v2 receipt, indexed 90-second source and its committed catalog record match; old sample remains retired",
     );
     expect(source.length).toBeGreaterThanOrEqual(minimumSize);
     expect(source.length).toBeLessThanOrEqual(maximumSize);

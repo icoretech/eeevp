@@ -1,5 +1,11 @@
 # Third-party notices
 
+## Demo media
+
+**Dario & Sam: The Token Rumble.mp4** is an AI parody by **Xanderwow ([@Xanderwow_A](https://x.com/Xanderwow_A))**. Source: [the creator's post](https://x.com/Xanderwow_A/status/2101800791795274106).
+
+The project's MIT license covers project code. It does not grant a license to this third-party video, other third-party media, or frames reproduced from them. Rights remain with their respective holders; this repository does not assert a separate redistribution license. The clip itself is stored outside the source tree and is not committed to this repository.
+
 ## shadcn/ui
 
 The generated components in `src/components/ui/` and `src/lib/utils.ts` include code from [shadcn/ui](https://github.com/shadcn-ui/ui). Its [upstream MIT license](https://github.com/shadcn-ui/ui/blob/6ea6856f5a1082d4d9c231559b6bc3ee73827493/LICENSE.md) is reproduced below.

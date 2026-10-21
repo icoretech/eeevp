@@ -1,12 +1,14 @@
 # Security model
 
-EEEVP encrypts before upload and decrypts in the browser. Private use keeps the encryption key secret on the client. The public read-only demo deliberately publishes its synthetic samples' key through an editable prefilled field. The server does not validate the entered key; any nonempty value opens the workspace, while only the matching key decrypts content.
+EEEVP encrypts before upload and decrypts in the browser. Private use keeps the encryption key secret on the client. The public read-only demo deliberately publishes its public samples' key through an editable prefilled field. The server does not validate the entered key; any nonempty value opens the workspace, while only the matching key decrypts content.
 
 ## Public demo and private use
 
 `DEMO_MODE=true` requires a canonical `DEMO_PUBLIC_KEY`: an intentionally disclosed symmetric library key. It is runtime configuration delivered to the UI, not a secret or a private recovery key. Public demo mode returns `403` for library initialization, uploads, chunk writes, completion, and deletion before accessing library storage. Session operations, encrypted reads, local search, and playback remain available.
 
-Use synthetic media only. The known public key makes these samples readable by anyone using the prefill; encryption demonstrates the browser pipeline rather than making the sample content confidential.
+Use only public, non-sensitive demo media with clear creator and source credits. The known public key makes these samples readable by anyone using the prefill; encryption demonstrates the browser pipeline rather than making the sample content confidential.
+
+Public availability does not put third-party media under the project's MIT license. Keep its creator and source credits and follow the [third-party notices](../THIRD_PARTY_NOTICES.md); do not reuse the demo key for private files.
 
 The public gate exposes only the editable prefilled key and login. Private recovery-file import and key generation stay under the initially collapsed **Advanced key tools** in private mode.
 
@@ -52,7 +54,7 @@ The storage provider receives already-encrypted application payloads. [Amazon S3
 
 Keep R2 credentials server-side and scope them to the single configured private bucket. All canonical records, including deletion markers, must survive restarts in that bucket. Local development uses its persistent filesystem volume. Storage failures must not create fallback state elsewhere.
 
-Use an independent random `SESSION_SECRET`; rotating it clears the validity of existing cookies without changing encrypted content. Never put a private encryption key into server environment files or the hosted container. `DEMO_PUBLIC_KEY` is the explicit intentionally public exception for the isolated read-only synthetic demo.
+Use an independent random `SESSION_SECRET`; rotating it clears the validity of existing cookies without changing encrypted content. Never put a private encryption key into server environment files or the hosted container. `DEMO_PUBLIC_KEY` is the explicit intentionally public exception for the isolated read-only public demo.
 
 Use HTTPS, preserve no-store API responses and service-worker cache headers, and avoid logging keys, recovery-file contents, or unlocked browser state. Back up the complete canonical storage namespace while keeping the recovery key separately. See the [deployment guide](deployment.md) for configuration and maintenance.
 

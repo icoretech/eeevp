@@ -6,7 +6,7 @@ EEEVP is a video library with browser-held encryption keys. One Next.js applicat
 
 Any nonempty key opens the browser workspace. The browser sends `POST /api/session` with an empty JSON object, and the server issues a signed HttpOnly convenience-session cookie. The raw key and imported recovery file never enter that request. The server does not determine whether the key can decrypt the library.
 
-`DEMO_MODE=true` is the public read-only presentation. Its required `DEMO_PUBLIC_KEY` is deliberately known and supplied at runtime to an editable prefilled field. It uses synthetic samples in a separate storage namespace. `DEMO_MODE=false` is writable local/private use with a different key and namespace; private keys are not server configuration.
+`DEMO_MODE=true` is the public read-only presentation. Its required `DEMO_PUBLIC_KEY` is deliberately known and supplied at runtime to an editable prefilled field. It uses public, non-sensitive samples in a separate storage namespace. `DEMO_MODE=false` is writable local/private use with a different key and namespace; private keys are not server configuration.
 
 The public gate offers only the editable prefilled key and login. In private mode, recovery-file import and new-key generation are under **Advanced key tools**, collapsed on initial display. Files are read or generated locally.
 
@@ -102,7 +102,7 @@ Public demo mode returns `403` for all five library mutation routes while allowi
 
 ## Why this boundary
 
-Provider-managed server-side encryption remains useful as an at-rest layer. It is not the application confidentiality boundary because the provider controls the managed keys for the objects it stores. R2 also automatically encrypts objects at rest with AES-256 and Cloudflare-managed keys; EEEVP uploads browser ciphertext first, so that provider layer protects ciphertext rather than plaintext media. A passive filesystem or object-store snapshot can still reveal identifiers, sizes, timestamps, and access patterns; without the private browser key it cannot directly recover names or media. The public demo is the deliberate exception because its synthetic key is published to viewers.
+Provider-managed server-side encryption remains useful as an at-rest layer. It is not the application confidentiality boundary because the provider controls the managed keys for the objects it stores. R2 also automatically encrypts objects at rest with AES-256 and Cloudflare-managed keys; EEEVP uploads browser ciphertext first, so that provider layer protects ciphertext rather than plaintext media. A passive filesystem or object-store snapshot can still reveal identifiers, sizes, timestamps, and access patterns; without the private browser key it cannot directly recover names or media. The public demo is the deliberate exception because its demo key is published to viewers.
 
 TLS protects the network hop. A passive observer who obtains TLS session material but not the private browser key still sees AES-GCM ciphertext in the application payload. Active endpoint compromise is different: malicious JavaScript, a compromised browser, or an unlocked device can capture keys or plaintext. EEEVP does not claim protection against that class of attack.
 

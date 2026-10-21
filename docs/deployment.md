@@ -1,6 +1,6 @@
 # Deployment
 
-The [live public demo](https://eeevp.synteq.app) runs read-only on one Synteq App backed by one private Cloudflare R2 bucket. It uses synthetic samples and an intentionally public prefilled key. Synteq supplies the runtime and HTTPS. R2 holds the library descriptor, encrypted catalog, chunks, drafts, and deletion markers. The bucket is deployment configuration, with no selector in the UI.
+The [live public demo](https://eeevp.synteq.app) runs read-only on one Synteq App backed by one private Cloudflare R2 bucket. It uses public, non-sensitive samples and an intentionally public prefilled key. Synteq supplies the runtime and HTTPS. R2 holds the library descriptor, encrypted catalog, chunks, drafts, and deletion markers. The bucket is deployment configuration, with no selector in the UI.
 
 The app was deployed on October 21, 2026. Its current Synteq plan is `free`, with 250m CPU and 512 MiB RAM. The plan's base price does not establish unlimited usage or a hard spending cap; inspect current metering and billing before changing resources or traffic expectations.
 
@@ -26,13 +26,15 @@ All mandatory values are explicit. Build without deployment secrets and supply t
 | `S3_FORCE_PATH_STYLE` | Required for `s3`: explicit `true` or `false` |
 | `S3_PREFIX` | Required for `s3`: restricted nonempty relative object prefix, without a trailing slash |
 
-Private encryption keys remain browser-only and are not server configuration. `DEMO_PUBLIC_KEY` is the explicit public exception: it is delivered to the editable prefilled field for synthetic samples. Never use an existing private recovery key for that setting. A random session secret can be generated with `openssl rand -hex 32`; it signs convenience-session cookies and cannot decrypt videos.
+Private encryption keys remain browser-only and are not server configuration. `DEMO_PUBLIC_KEY` is the explicit public exception: it is delivered to the editable prefilled field for public, non-sensitive samples. Never use an existing private recovery key for that setting. A random session secret can be generated with `openssl rand -hex 32`; it signs convenience-session cookies and cannot decrypt videos.
 
 ## Prepare the public dataset
 
-Choose a dedicated public demo key and isolated R2 prefix. Keep the HTTP application in `DEMO_MODE=true`; it cannot initialize or upload its own dataset. Populate or replace synthetic samples through a separate privileged operator workflow using that intentionally public key and the same encrypted packet format.
+Choose a dedicated public demo key and isolated R2 prefix. Keep the HTTP application in `DEMO_MODE=true`; it cannot initialize or upload its own dataset. Populate or replace public, non-sensitive samples through a separate privileged operator workflow using that intentionally public key and the same encrypted packet format.
 
 The repository's opt-in operator harness requires an explicit publication or retirement action, validates the prepared media and its receipts, and keeps the prior record until replacement playback is verified. It is deployment-specific administration, not part of ordinary browser acceptance or the public API. Keep its prepared files and operator paths out of user-facing setup.
+
+For third-party samples, retain creator/source credits in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md). The code's MIT license does not grant rights to third-party media or frames. Do not commit sample video files into the source tree.
 
 Public mode uses the published descriptor and samples. Private use stays `DEMO_MODE=false` with a different private key and prefix or filesystem volume; never point the public demo at a private dataset. Its import and generation controls remain under the initially collapsed **Advanced key tools**.
 

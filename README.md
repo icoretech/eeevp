@@ -8,13 +8,15 @@
 
 EEEVP means **encrypted end-to-end video player**. Enter a key to open your library. The matching encryption key reveals filenames and plays the videos; a wrong key leaves encrypted names unreadable. Video content and filenames are encrypted before upload, and the browser decrypts the bytes needed for playback and seeking.
 
-Public demo mode is read-only and uses synthetic samples with an intentionally public key prefilled in an editable field. Its gate shows the key and login action; import and generation tools are hidden. Use the prefilled key to watch, or change it to see unreadable encrypted names. Private use requires a different key and storage namespace.
+Public demo mode is read-only and uses public, non-sensitive samples with an intentionally public key prefilled in an editable field. Its gate shows the key and login action; import and generation tools are hidden. Use the prefilled key to watch, or change it to see unreadable encrypted names. Private use requires a different key and storage namespace.
 
 [Official challenge announcement](https://x.com/synteq/status/2112626108231254140) · [iCoreTech entry announcement](https://x.com/icoretech_inc/status/2112644881780818180) · [Event rules](https://hack.synteq.app/rules)
 
 ![EEEVP read-only library with an encrypted synthetic WebM video](docs/images/library.png)
 
 *Read-only demo with a synthetic 90-second `Motion study` sample: 23.6 MiB across 24 encrypted chunks.*
+
+Demo media credit: **Dario & Sam: The Token Rumble.mp4** is an AI parody by **Xanderwow ([@Xanderwow_A](https://x.com/Xanderwow_A))**, from [the creator's source post](https://x.com/Xanderwow_A/status/2101800791795274106). The project's MIT license covers code, not third-party video or frames; see [third-party notices](THIRD_PARTY_NOTICES.md).
 
 ## Run the demo
 
@@ -69,7 +71,7 @@ Public demo mode demonstrates the encryption mechanics with a deliberately known
 | Provider-managed encryption | R2 adds automatic AES-256 encryption at rest to the browser ciphertext | Provider-managed keys are an additional at-rest layer, not the application privacy boundary; client-side AES-GCM keeps plaintext out of the storage path |
 | Network observer | HTTPS/TLS protects transport against eavesdropping, tampering, and forgery | A compromised endpoint, active proxy, or leaked TLS endpoint can still observe requests |
 | Browser/application compromise | Authenticated AES-GCM rejects modified or misbound ciphertext | Malicious delivered JavaScript, extensions, an unlocked device, or an authorized viewer can read or copy plaintext |
-| Public demo mode | Server blocks all five library mutation routes and serves only seeded synthetic samples | The demo key is intentionally public; its content is not confidential |
+| Public demo mode | Server blocks all five library mutation routes and serves public, non-sensitive samples | The demo key is intentionally public; its content is not confidential |
 | Writable private mode | Browser encryption keeps private media and names out of passive storage | The convenience session is not key possession; an opened session can invoke mutation APIs, so integrity and availability need deployment-level controls |
 
 HTTPS is required for session transport and service-worker playback. Browser AES-GCM remains the content boundary after transport termination: a passive observer who obtains TLS session material still sees AES-GCM ciphertext unless it also obtains the private browser key. Active JavaScript or an endpoint compromise can capture the key or plaintext.

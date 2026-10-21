@@ -4,7 +4,7 @@
 - The product is a browser-encrypted video library with its canonical encrypted catalog on the server; every video list, metadata, and chunk request requires the convenience session
 - Any nonempty key opens the browser workspace; only the matching encryption key decrypts names and videos, and the key remains in browser memory
 - POST /api/session accepts an empty JSON object without receiving or checking the entered key; session presence and Origin guards do not prove key possession, and writable private-use mode still lacks strong write authorization
-- DEMO_MODE is mandatory: true makes the public synthetic demo read-only and requires an intentionally public DEMO_PUBLIC_KEY for the editable prefilled field; false is local/private use with a different encryption key and storage namespace
+- DEMO_MODE is mandatory: true makes the public demo read-only and requires an intentionally public DEMO_PUBLIC_KEY for the editable prefilled field; false is local/private use with a different encryption key and storage namespace
 - In DEMO_MODE=true, every library initialization, upload, chunk write, completion, and deletion route must return 403 before mutation; session operations and encrypted reads remain available
 - Use Docker Compose for all JavaScript tooling: `docker compose exec -T web yarn ...`; do not silently run checks on the host
 - Use Yarn 4 and install dependencies through Yarn commands
@@ -13,7 +13,8 @@
 - Keep application tests under `tests/`, separate from source files
 - Use official shadcn CLI components; do not hand-edit `src/components/ui` or `src/lib/utils.ts`
 - Private encryption keys and plaintext video metadata belong exclusively in the browser; never send private keys to server configuration, requests, logs, or analytics, and never publish an existing private recovery key
-- DEMO_PUBLIC_KEY is the explicit intentionally public exception used only with synthetic read-only samples; never reuse it or its storage namespace for private content
+- DEMO_PUBLIC_KEY is the explicit intentionally public exception used only with public, non-sensitive read-only samples; never reuse it or its storage namespace for private content
+- Public demo media may include selected third-party samples with creator/source credits in THIRD_PARTY_NOTICES.md; project MIT licensing covers code and does not grant rights to third-party media or their frames, and video files stay outside the tracked source tree
 - Private-mode recovery import and key generation belong under initially collapsed Advanced key tools; public demo mode exposes only the editable prefilled key and login, without advanced/import/generate controls
 - Keep robots.txt disallowing all paths and page metadata set to noindex and nofollow; crawler directives are not access controls
 - Drive the fixed-height decryption HUD only from successful authenticated chunk events for the exact playback owner; deduplicate coverage, keep notifications at most 5 Hz, expose no keys/plaintext/names/URLs, and keep idle and reduced-motion states static
